@@ -581,45 +581,63 @@ async def play(c: Client, m: Message):
             found, failure = await find_and_download_music(query, suhu)
             if not found:
                 await suhu.edit(f"❌ **Could not play this music.**\n\n» `{failure[:900]}`")
-            else:
-                songname = found["title"]
-                title = songname
-                url = found["url"]
-                duration = found["duration"]
-                thumbnail = found["thumbnail"]
-                ytlink = found["media"]
-                userid = m.from_user.id
-                gcname = m.chat.title
+                return
+
+            songname = found["title"]
+            url = found["url"]
+            duration = found["duration"]
+            thumbnail = found["thumbnail"]
+            ytlink = found["media"]
+            userid = m.from_user.id if m.from_user else 0
+            gcname = m.chat.title or "Telegram Chat"
+            image = None
+
+            # Artwork is optional and must never prevent audio playback.
+            try:
+                log.info("Preparing track artwork for provider=%s title=%r", found.get("provider", "unknown"), songname[:80])
+                ctitle = await asyncio.wait_for(CHAT_TITLE(gcname), timeout=5)
+                image = await asyncio.wait_for(thumb(thumbnail, songname, userid, ctitle), timeout=20)
+                log.info("Track artwork prepared successfully")
+            except Exception as exc:
+                log.warning("Track artwork failed or timed out; continuing without thumbnail: %s: %s", type(exc).__name__, exc)
+                image = None
+
+            requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})" if m.from_user else "Unknown"
+            if chat_id in QUEUE:
+                pos = add_to_queue(chat_id, songname, ytlink, url, "Audio", 0)
+                if pos == -1:
+                    return await suhu.edit(f"🚫 queue is full (max {MAX_QUEUE_SIZE}).")
+                await suhu.delete()
+                caption = f"💡 **Track added to queue »** `{pos}`\n\n🏷 **Name:** [{songname}]({url})\n**⏱ Duration:** `{duration}`\n🎧 **Request by:** {requester}"
+                if image:
+                    await m.reply_photo(photo=image, caption=caption, reply_markup=keyboard)
+                else:
+                    await m.reply_text(caption, reply_markup=keyboard)
+                return
+
+            try:
+                await suhu.edit("🔄 **Starting audio stream...**")
+                log.info("Calling PyTgCalls play for chat_id=%s provider=%s", chat_id, found.get("provider", "unknown"))
+                await asyncio.wait_for(call_py.play(chat_id, media_audio(ytlink)), timeout=45)
+                log.info("PyTgCalls play returned successfully for chat_id=%s", chat_id)
+                add_to_queue(chat_id, songname, ytlink, url, "Audio", 0)
+            except Exception as exc:
+                log.exception("PyTgCalls playback failed for chat_id=%s", chat_id)
                 try:
-                    ctitle = await CHAT_TITLE(gcname)
-                    image = await thumb(thumbnail, title, userid, ctitle)
-                except Exception as e:
-                    return await suhu.edit(f"🚫 couldn't build the thumbnail: `{e}`")
-                    if chat_id in QUEUE:
-                        pos = add_to_queue(chat_id, songname, ytlink, url, "Audio", 0)
-                        if pos == -1:
-                            return await suhu.edit(f"🚫 queue is full (max {MAX_QUEUE_SIZE}).")
-                        await suhu.delete()
-                        requester = (
-                            f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
-                        )
-                        await m.reply_photo(
-                            photo=image,
-                            caption=f"💡 **Track added to queue »** `{pos}`\n\n🏷 **Name:** [{songname}]({url}) | `music`\n**⏱ Duration:** `{duration}`\n🎧 **Request by:** {requester}",
-                            reply_markup=keyboard,
-                        )
-                    else:
-                        try:
-                            await suhu.edit("🔄 **Joining vc...**")
-                            await call_py.play(chat_id, media_audio(ytlink))
-                            add_to_queue(chat_id, songname, ytlink, url, "Audio", 0)
-                            await suhu.delete()
-                            requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
-                            await m.reply_photo(
-                                photo=image,
-                                caption=f"🏷 **Name:** [{songname}]({url})\n**⏱ Duration:** `{duration}`\n💡 **Status:** `Playing`\n🎧 **Request by:** {requester}\n📹 **Stream type:** `Music`",
-                                reply_markup=keyboard,
-                            )
-                        except Exception as ep:
-                            await suhu.delete()
-                            await m.reply_text(f"🚫 error: `{ep}`")
+                    await suhu.edit(f"🚫 **Could not start playback.**\n\n`{str(exc)[:700]}`", parse_mode=None)
+                except Exception:
+                    await m.reply_text(f"🚫 Could not start playback: {str(exc)[:700]}", parse_mode=None)
+                return
+
+            try:
+                await suhu.delete()
+            except Exception:
+                pass
+            caption = f"🏷 **Name:** [{songname}]({url})\n**⏱ Duration:** `{duration}`\n💡 **Status:** `Playing`\n🎧 **Request by:** {requester}\n📹 **Stream type:** `Music`"
+            try:
+                if image:
+                    await m.reply_photo(photo=image, caption=caption, reply_markup=keyboard)
+                else:
+                    await m.reply_text(caption, reply_markup=keyboard)
+            except Exception as exc:
+                log.warning("Playback started but status announcement failed: %s", exc)
