@@ -32,23 +32,22 @@ _DEFAULT_USER_AGENT = (
 
 
 def _ytdl_site_flags():
-    """Build common yt-dlp flags; cookies are also applied to YouTube."""
-    flags = ["--socket-timeout", "60"]
+    """Build yt-dlp flags shared by supported sites."""
+    flags = ["--socket-timeout", "60", "--retries", "3", "--fragment-retries", "3"]
     if COOKIES_FILE:
         flags += ["--cookies", COOKIES_FILE]
-    flags += ["--user-agent", _DEFAULT_USER_AGENT]
+    # Do not force a desktop Chrome UA on YouTube's TV/mobile player clients:
+    # mismatched client headers can cause media URLs to be rejected with HTTP 403.
     if PROXY_URL:
         flags += ["--proxy", PROXY_URL]
     return flags
 
 
 def _youtube_client_args():
-    """Choose a YouTube player client; the no-cookie fallback is best-effort."""
-    # The Android client has been triggering bot checks on some hosted IPs.
-    # Try TV + Safari web clients when no cookies are configured. This is not
-    # guaranteed to bypass YouTube restrictions and may need future adjustment.
-    client = "web" if COOKIES_FILE else "tv,web_safari"
-    return ["--extractor-args", f"youtube:player_client={client}"]
+    """Select a YouTube client that can expose audio formats without browser cookies."""
+    # android_vr is often more reliable for server-side audio extraction than
+    # combining TV and browser clients. Cookies remain supported when configured.
+    return ["--extractor-args", "youtube:player_client=android_vr"]
 
 
 def ytsearch(query: str):

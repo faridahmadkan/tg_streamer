@@ -86,3 +86,15 @@ Open `http://localhost:3000/health` (or the port in `PORT`) to check the service
 - Telegram voice streaming depends on PyTgCalls/NTgCalls and the assistant user session; the Node.js layer is only the web-service supervisor and health endpoint. It does not replace or reimplement the streaming engine.
 - All group commands and button callbacks are restricted centrally. If an administrator was just promoted/demoted and access seems stale, run `/reload` as a group admin to refresh the cached list.
 - Use only media you have permission to stream or download, and comply with Telegram and source-service terms.
+
+
+### YouTube HTTP 403 troubleshooting
+
+The bot uses a dedicated YouTube player client for audio/video extraction and
+does not force a desktop browser User-Agent onto that client. yt-dlp is installed
+from `requirements.txt`; redeploy after updating dependencies. YouTube can still
+block datacenter IPs or require account cookies for some videos. If 403 persists,
+set `COOKIES_BASE64` to a Base64-encoded Netscape-format `cookies.txt` exported
+from your own signed-in browser session (keep it secret; never commit it), or try
+a different hosting region/network. Cookies cannot guarantee access to private,
+age-restricted, or otherwise unavailable videos.
