@@ -1,8 +1,9 @@
+
 tgcrypto
 ffmpeg-python
 py-tgcalls
 kurigram
-yt-dlp
+yt-dlp[default,curl-cffi]
 youtube-search-python==1.4.9
 youtube-search
 python-dotenv
@@ -13,8 +14,6 @@ requests
 pillow
 psutil
 wget
-# extra stream resolvers: headless-browser fallback (Chromium itself is opt-in
-# via INSTALL_BROWSER), plus deps commonly needed by extractor plugins
 playwright
 curl_cffi
 pycryptodomex
