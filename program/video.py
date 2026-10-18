@@ -51,8 +51,11 @@ def _ytdl_site_flags():
 
 
 def _youtube_client_args():
-    """Use the web client when cookies are configured; otherwise use android."""
-    client = "web" if COOKIES_FILE else "android"
+    """Choose a YouTube player client; the no-cookie fallback is best-effort."""
+    # The Android client has been triggering bot checks on some hosted IPs.
+    # Try TV + Safari web clients when no cookies are configured. This is not
+    # guaranteed to bypass YouTube restrictions and may need future adjustment.
+    client = "web" if COOKIES_FILE else "tv,web_safari"
     return ["--extractor-args", f"youtube:player_client={client}"]
 
 
@@ -65,6 +68,8 @@ def ytsearch(query: str):
             cmd = ["yt-dlp", "--no-warnings", "--skip-download",
                    "--print", "%(title)s\x1f%(duration_string)s\x1f%(id)s\x1f%(thumbnail)s"]
             cmd += _ytdl_site_flags()
+            if is_yt:
+                cmd += _youtube_client_args()
             cmd.append(q)
             out = subprocess.run(
                 cmd,
