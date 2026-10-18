@@ -98,3 +98,13 @@ set `COOKIES_BASE64` to a Base64-encoded Netscape-format `cookies.txt` exported
 from your own signed-in browser session (keep it secret; never commit it), or try
 a different hosting region/network. Cookies cannot guarantee access to private,
 age-restricted, or otherwise unavailable videos.
+
+
+### YouTube “The page needs to be reloaded” errors
+
+The app no longer pins YouTube to a legacy `tv` player client. It lets the current
+yt-dlp release select its supported clients and upgrades yt-dlp during Nixpacks
+installation. After deploying, trigger a clean rebuild (clear the build cache) so
+the updated downloader is installed. If YouTube still rejects extraction, update
+yt-dlp again and configure valid cookies from your own account; YouTube can block
+cloud-hosting IPs independently of the bot code.

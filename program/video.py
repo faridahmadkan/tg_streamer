@@ -52,11 +52,12 @@ def _ytdl_site_flags():
 
 
 def _youtube_client_args():
-    """Select a YouTube client that can expose audio formats without browser cookies."""
-    # android_vr is often more reliable for server-side audio extraction than
-    # combining TV and browser clients. Cookies remain supported when configured.
-    return ["--extractor-args", "youtube:player_client=tv"]
+    """Let current yt-dlp choose supported YouTube player clients automatically.
 
+    Hard-coding legacy clients (such as ``tv``) can trigger YouTube's
+    "The page needs to be reloaded" response or hide all downloadable formats.
+    """
+    return []
 
 def ytsearch(query: str):
     try:
@@ -192,7 +193,8 @@ async def ytdl(link, status_msg=None):
         "--newline",
         "--progress-template",
         "download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-        # When cookies are configured, use the web client; otherwise try TV/Safari.
+        # Use yt-dlp's current default YouTube clients; hard-coded legacy clients
+        # can trigger reload/SABR errors and hide audio formats.
         *(_youtube_client_args() if _YT_RE.match(link) else []),
         # Prefer H.264 video + AAC(m4a) audio so the merge produces a universally
         # playable, light-to-stream mp4 (avoids AV1/VP9/Opus -> mp4 issues).
