@@ -96,8 +96,13 @@ async def start_bot():
     asyncio.ensure_future(heartbeat())
     asyncio.ensure_future(track_position())
     asyncio.ensure_future(radio_updater())
-    log.info("starting pytgcalls client")
-    await call_py.start()
+    log.info("starting pytgcalls client (PyTgCalls version=%s)", getattr(__import__("pytgcalls"), "__version__", "unknown"))
+    try:
+        await call_py.start()
+    except Exception:
+        log.exception("PyTgCalls startup failed")
+        raise
+    log.info("pytgcalls client started successfully")
     await idle()
     log.info("stopping bot & userbot")
     await bot.stop()

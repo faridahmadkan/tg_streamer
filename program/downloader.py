@@ -20,7 +20,7 @@ from pyrogram.types import Message
 @errors
 async def song(c: Client, m: Message):
     if len(m.command) < 2:
-        return await m.reply("» usage: `/song <name or YouTube URL>`")
+        return await m.reply("» Usage: /song name or YouTube URL", parse_mode=None)
     query = m.text.split(None, 1)[1]
     status = await m.reply("🔎 **finding song…**")
     if query.startswith("http"):
@@ -51,7 +51,7 @@ async def song(c: Client, m: Message):
 @errors
 async def video(c: Client, m: Message):
     if len(m.command) < 2:
-        return await m.reply("» usage: `/video <name or YouTube URL>`")
+        return await m.reply("» Usage: /video name or YouTube URL", parse_mode=None)
     query = m.text.split(None, 1)[1]
     status = await m.reply("🔎 **finding video…**")
     if query.startswith("http"):

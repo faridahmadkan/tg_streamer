@@ -195,27 +195,37 @@ async def ytdl(format: str, link: str, status_msg=None):
     # the direct stream URL and hand it to ffmpeg live (same as radio).
     # YouTube must still be downloaded first because its URLs 403 ffmpeg directly.
     if not _YT_RE.match(link):
-        proc = await asyncio.create_subprocess_exec(
-            "yt-dlp", "--no-warnings", "--no-playlist",
-            *_ytdl_site_flags(),
-            "-f", "worstaudio/worst",
-            "--print", "%(url)s",
-            link,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
+        started_at = time()
+        log.info("Starting yt-dlp stream resolution for non-YouTube URL: %s", link[:180])
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "yt-dlp", "--no-warnings", "--no-playlist",
+                *_ytdl_site_flags(),
+                "-f", "worstaudio/worst",
+                "--print", "%(url)s",
+                link,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception:
+            log.exception("Could not launch yt-dlp for URL %s", link[:180])
+            return 0, "Could not start yt-dlp; check the Railway runtime and executable path."
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=35)
         except asyncio.TimeoutError:
+            log.warning("yt-dlp stream resolution timed out after 35s: %s", link[:180])
             proc.kill()
             await proc.wait()
             return 0, "Provider timed out while resolving the audio stream (35 seconds)."
+        elapsed = time() - started_at
         if proc.returncode == 0:
             # --print may emit more than one line; the final non-empty line is the URL.
             lines = [line.strip() for line in stdout.decode(errors="ignore").splitlines() if line.strip()]
             url = lines[-1] if lines else ""
             if url.startswith(("https://", "http://")):
+                log.info("yt-dlp resolved audio stream in %.1fs", elapsed)
                 return 1, url
         err = stderr.decode(errors="ignore")[-400:]
+        log.warning("yt-dlp stream resolution failed (exit=%s, %.1fs): %s", proc.returncode, elapsed, err or "no stderr")
         return 0, (err or "stream URL extraction failed")
 
     proc = await asyncio.create_subprocess_exec(
@@ -293,12 +303,16 @@ async def ytdl(format: str, link: str, status_msg=None):
 async def find_and_download_music(query: str, status_msg=None):
     """Search multiple catalogs and try candidates until one streams/downloads."""
     # Search providers in a worker thread so a slow external search cannot block Telegram updates.
+    log.info("Starting music search for query=%r", query[:120])
     candidates = await asyncio.to_thread(ytsearch_all, query, 5)
+    log.info("Music search returned %d candidate(s)", len(candidates))
     if not candidates:
         return None, "No results found across YouTube and SoundCloud."
     errors = []
     for index, candidate in enumerate(candidates, start=1):
         title, url, duration, thumbnail, provider = candidate
+        started_at = time()
+        log.info("Candidate %d/%d: provider=%s title=%r url=%s", index, len(candidates), provider, title[:100], url[:180])
         try:
             if status_msg is not None:
                 await status_msg.edit(f"🔎 **Trying {provider or 'music provider'}** ({index}/{len(candidates)})…\n\n🏷 `{title[:70]}`")
@@ -309,11 +323,16 @@ async def find_and_download_music(query: str, status_msg=None):
                 )
             except asyncio.TimeoutError:
                 ok, result = 0, "Provider attempt timed out after 85 seconds."
+                log.warning("Candidate timed out after 85s: provider=%s url=%s", provider, url[:180])
+            elapsed = time() - started_at
             if ok:
+                log.info("Candidate resolved successfully in %.1fs: provider=%s", elapsed, provider)
                 return {"title": title, "url": url, "duration": duration,
                         "thumbnail": thumbnail, "provider": provider, "media": result}, None
+            log.warning("Candidate failed after %.1fs: provider=%s reason=%s", elapsed, provider, str(result)[-300:])
             errors.append(f"{provider or 'provider'}: {str(result)[-180:]}")
         except Exception as exc:
+            log.exception("Unexpected error resolving candidate from provider=%s", provider)
             errors.append(f"{provider or 'provider'}: {str(exc)[-180:]}")
     return None, "All providers failed. " + " | ".join(errors[-3:])
 

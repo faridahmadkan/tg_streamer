@@ -31,7 +31,7 @@ def _results(query, n=6):
 @errors
 async def search_cmd(c: Client, m: Message):
     if len(m.command) < 2:
-        return await m.reply("» usage: `/search <song or video name>`")
+        return await m.reply("» Usage: /search song or video name", parse_mode=None)
     query = m.text.split(None, 1)[1]
     loading = await m.reply("🔍 **Searching…**")
     res = await asyncio.to_thread(_results, query)

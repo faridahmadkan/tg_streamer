@@ -124,3 +124,15 @@ Configured bot administrators (`SUDO_USERS` in the environment) can send `/provi
 
 A selected provider is a preference, not a hard lock: if it fails, the bot tries other available sources. The setting is stored in `data/music_provider.json`; use persistent storage for the `data/` directory if your hosting filesystem is ephemeral. YouTube Music and YouTube share underlying YouTube delivery, so they are separate preferences rather than independent audio hosts.
 
+
+### Railway music playback diagnostics
+
+This build logs the PyTgCalls startup result and the music-resolution lifecycle. In Railway runtime logs, look for:
+
+- `pytgcalls client started successfully` — confirms the PyTgCalls start call returned.
+- `Starting music search` and `Music search returned ... candidate(s)` — confirms the search stage ran.
+- `Candidate ... provider=SoundCloud` — identifies the exact URL/provider being resolved.
+- `yt-dlp stream resolution timed out after 35s` or `Candidate timed out after 85s` — identifies a resolver timeout.
+- `Candidate resolved successfully` — confirms the stream resolver returned media successfully; if audio still does not play, investigate the subsequent Telegram playback stage.
+
+Please redact bot tokens, API hashes, session strings, cookies, and other credentials before sharing logs.

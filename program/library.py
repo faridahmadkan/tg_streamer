@@ -387,7 +387,7 @@ async def lplay(c: Client, m: Message):
     if _disabled():
         return await m.reply("📚 the local library isn't configured.")
     if len(m.command) < 2:
-        return await m.reply("» usage: `/lplay <part of a filename or folder name>`  (or browse with /library)")
+        return await m.reply("» Usage: /lplay part of a filename or folder name (or browse with /library)", parse_mode=None)
     needle = m.text.split(None, 1)[1].strip().lower()
 
     # A folder-name match queues the whole folder as a playlist (e.g. a show,
