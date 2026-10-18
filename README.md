@@ -108,3 +108,8 @@ installation. After deploying, trigger a clean rebuild (clear the build cache) s
 the updated downloader is installed. If YouTube still rejects extraction, update
 yt-dlp again and configure valid cookies from your own account; YouTube can block
 cloud-hosting IPs independently of the bot code.
+
+
+## Music provider selection
+
+Bot admins can use `/provider` in Telegram to choose **Auto**, **YouTube**, **YouTube Music**, **SoundCloud**, or **Google Videos**. The selected catalog is prioritized; if it fails, the bot searches the remaining catalogs as fallbacks. The preference is saved to `data/music_provider.json` on the host filesystem. On ephemeral hosting, persist the `data/` directory with a volume if you want this setting to survive restarts. Provider availability depends on yt-dlp support, network access, and each service's restrictions; no provider can guarantee every track.

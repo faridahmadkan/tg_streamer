@@ -20,6 +20,7 @@ from program.radio import radio_updater
 import program.iptv  # registers /iptv handlers
 
 BOT_COMMANDS = [
+    BotCommand("provider", "choose music search provider (bot admin)"),
     BotCommand("play", "play music from YouTube, or reply to an audio"),
     BotCommand("vplay", "play video from YouTube, or reply to a video"),
     BotCommand("vstream", "stream a live / m3u8 / YouTube link"),
