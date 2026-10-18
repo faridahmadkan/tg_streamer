@@ -22,19 +22,20 @@ from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import UserAlreadyParticipant, UserNotParticipant, PeerIdInvalid
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
-from youtubesearchpython import VideosSearch
 
 
 log = logging.getLogger(__name__)
 
 _PROVIDER_FILE = Path("data/music_provider.json")
 _PROVIDER_OPTIONS = {
-    "auto": "Auto (fallback)",
-    "youtube": "YouTube",
-    "youtube_music": "YouTube Music",
-    "soundcloud": "SoundCloud",
-    "google_videos": "Google Videos",
+    "auto": "Auto (SoundCloud + Internet Archive)",
+    "soundcloud": "SoundCloud search",
+    "archive": "Internet Archive (public/authorized audio)",
+    "bandcamp": "Bandcamp (direct links)",
+    "audiomack": "Audiomack (direct links)",
+    "mixcloud": "Mixcloud (direct links)",
 }
+
 
 def _get_provider():
     try:
@@ -42,6 +43,7 @@ def _get_provider():
         return value if value in _PROVIDER_OPTIONS else "auto"
     except Exception:
         return "auto"
+
 
 def _set_provider(value):
     if value not in _PROVIDER_OPTIONS:
@@ -54,69 +56,83 @@ def _set_provider(value):
         log.warning("Could not persist music provider: %s", exc)
         return False
 
-_DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-)
-
-
 def _ytdl_site_flags():
     """Build yt-dlp flags shared by supported sites."""
     flags = ["--socket-timeout", "60", "--retries", "5", "--fragment-retries", "5", "--extractor-retries", "3", "--file-access-retries", "3"]
     if COOKIES_FILE:
         flags += ["--cookies", COOKIES_FILE]
-    # Do not force a desktop Chrome UA on YouTube's TV/mobile player clients:
-    # mismatched client headers can cause media URLs to be rejected with HTTP 403.
     if PROXY_URL:
         flags += ["--proxy", PROXY_URL]
     return flags
 
 
-def _youtube_client_args():
-    """Let current yt-dlp choose supported YouTube player clients automatically.
+_YOUTUBE_RE = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/", re.I)
+_AUDIO_HOSTS = (
+    "soundcloud.com", "bandcamp.com", "audiomack.com", "mixcloud.com",
+    "archive.org", "www.archive.org",
+)
 
-    Hard-coding legacy clients (such as ``tv``) can trigger YouTube's
-    "The page needs to be reloaded" response or hide all downloadable formats.
-    """
-    return []
+
+def _internet_archive_search(query: str, limit: int = 5):
+    """Search Internet Archive's public audio catalog and return downloadable audio items."""
+    from urllib.parse import urlencode, quote
+    from urllib.request import Request, urlopen
+
+    safe_query = query.replace('"', ' ').strip()[:100]
+    params = urlencode({
+        "q": f'mediatype:audio AND (title:"{safe_query}" OR creator:"{safe_query}" OR description:"{safe_query}")',
+        "fl[]": ["identifier", "title", "creator"],
+        "rows": max(1, min(limit, 8)),
+        "output": "json",
+    }, doseq=True)
+    request = Request("https://archive.org/advancedsearch.php?" + params,
+                      headers={"User-Agent": "KhanStreamer/1.0 (audio catalog search)"})
+    results = []
+    try:
+        with urlopen(request, timeout=8) as response:
+            docs = json.loads(response.read().decode("utf-8")).get("response", {}).get("docs", [])
+        for item in docs:
+            identifier = item.get("identifier")
+            if not identifier:
+                continue
+            meta_req = Request(f"https://archive.org/metadata/{quote(identifier)}",
+                               headers={"User-Agent": "KhanStreamer/1.0"})
+            try:
+                with urlopen(meta_req, timeout=8) as response:
+                    files = json.loads(response.read().decode("utf-8")).get("files", [])
+            except Exception as exc:
+                log.debug("Archive metadata failed for %s: %s", identifier, exc)
+                continue
+            audio = next((f for f in files if str(f.get("name", "")).lower().endswith(
+                (".mp3", ".m4a", ".ogg", ".opus", ".flac", ".wav"))
+                and not f.get("private") and not f.get("source", "").startswith("original")), None)
+            if not audio:
+                audio = next((f for f in files if str(f.get("name", "")).lower().endswith(
+                    (".mp3", ".m4a", ".ogg", ".opus", ".flac", ".wav")) and not f.get("private")), None)
+            if not audio:
+                continue
+            title = item.get("title") or identifier
+            file_name = audio.get("name", "")
+            url = f"https://archive.org/download/{quote(identifier)}/{quote(file_name)}"
+            results.append([title, url, str(audio.get("length", "")), "", "Internet Archive"])
+            if len(results) >= limit:
+                break
+    except Exception as exc:
+        log.warning("Internet Archive search failed: %s", exc)
+    return results
+
 
 def ytsearch(query: str):
-    try:
-        q = query.strip()
-        is_yt = bool(re.match(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/", q))
-        if re.match(r"https?://", q):
-            # any direct URL — use yt-dlp for metadata (handles YouTube, Rutube, Vimeo, …)
-            cmd = ["yt-dlp", "--no-warnings", "--skip-download",
-                   "--print", "%(title)s\x1f%(duration_string)s\x1f%(id)s\x1f%(thumbnail)s"]
-            cmd += _ytdl_site_flags()
-            if is_yt:
-                cmd += _youtube_client_args()
-            cmd.append(q)
-            out = subprocess.run(
-                cmd,
-                capture_output=True, text=True, timeout=90,
-            ).stdout.strip().split("\x1f")
-            title = out[0] if out and out[0] else q
-            duration = out[1] if len(out) > 1 else ""
-            vid = out[2] if len(out) > 2 and out[2] else ""
-            raw_thumb = out[3] if len(out) > 3 else ""
-            # prefer the well-known HQ thumbnail URL for YouTube
-            thumbnail = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if is_yt and vid else raw_thumb
-            return [title, q, duration, thumbnail]
-        search = VideosSearch(query, limit=1).result()
-        data = search["result"][0]
-        songname = data["title"]
-        url = data["link"]
-        duration = data["duration"]
-        thumbnail = f"https://i.ytimg.com/vi/{data['id']}/hqdefault.jpg"
-        return [songname, url, duration, thumbnail]
-    except Exception as e:
-        log.warning("ytsearch failed: %s", e)
+    """Compatibility helper: return the first non-YouTube music result."""
+    results = ytsearch_all(query, 1)
+    if not results:
         return 0
+    title, url, duration, thumbnail, _provider = results[0]
+    return [title, url, duration, thumbnail]
 
 
 def ytsearch_all(query: str, limit: int = 5):
-    """Search multiple catalogs in selected-provider-first order, then fall back."""
+    """Search supported music sources; YouTube is intentionally excluded."""
     q = (query or "").strip()
     if not q:
         return []
@@ -126,234 +142,118 @@ def ytsearch_all(query: str, limit: int = 5):
         if not url:
             return
         url = str(url).strip()
-        if not url.startswith(("https://", "http://")) or url in seen:
+        if not url.startswith(("https://", "http://")) or url in seen or _YOUTUBE_RE.match(url):
             return
         seen.add(url)
         candidates.append([title or q, url, duration or "", thumbnail or "", provider])
 
     if re.match(r"https?://", q, re.I):
-        first = ytsearch(q)
-        if first:
-            add(*first, provider="Direct URL")
+        if _YOUTUBE_RE.match(q):
+            log.info("Rejected YouTube URL because YouTube support is disabled for music")
+            return []
+        if not any(host in q.lower().split("/")[2] for host in _AUDIO_HOSTS):
+            log.warning("Direct music URL is not from an enabled provider: %s", q[:160])
+            return []
+        try:
+            proc = subprocess.run(
+                ["yt-dlp", "--no-warnings", "--skip-download", "--no-playlist", *_ytdl_site_flags(),
+                 "--print", "%(title)s\x1f%(duration_string)s\x1f%(thumbnail)s", q],
+                capture_output=True, text=True, timeout=25,
+            )
+            fields = proc.stdout.strip().split("\x1f")
+            title = fields[0] if fields and fields[0] else q
+            duration = fields[1] if len(fields) > 1 else ""
+            thumbnail = fields[2] if len(fields) > 2 else ""
+            host = q.lower().split("/")[2]
+            provider = next((name for domain, name in [
+                ("soundcloud.com", "SoundCloud"), ("bandcamp.com", "Bandcamp"),
+                ("audiomack.com", "Audiomack"), ("mixcloud.com", "Mixcloud"),
+                ("archive.org", "Internet Archive")
+            ] if domain in host), "Audio provider")
+            add(title, q, duration, thumbnail, provider)
+        except Exception as exc:
+            log.warning("Direct provider metadata lookup failed: %s", exc)
         return candidates
 
     selected = _get_provider()
-    if selected in ("auto", "youtube", "youtube_music"):
-        try:
-            result = VideosSearch(q, limit=limit).result().get("result", [])
-            for item in result:
-                vid = item.get("id", "")
-                add(item.get("title"), item.get("link"), item.get("duration"),
-                    f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if vid else "",
-                    "YouTube Music" if selected == "youtube_music" else "YouTube")
-        except Exception as exc:
-            log.warning("YouTube search provider failed: %s", exc)
-
-    search_sources = [
-        ("scsearch", "SoundCloud", "soundcloud"),
-        ("ytsearch", "YouTube (yt-dlp)", "youtube"),
-        ("gvsearch", "Google Videos", "google_videos"),
-    ]
-    if selected != "auto":
-        search_sources.sort(key=lambda item: 0 if item[2] == selected else 1)
-    for prefix, provider, key in search_sources:
-        if key == "youtube" and selected in ("auto", "youtube", "youtube_music"):
-            continue
+    if selected in ("auto", "soundcloud"):
         try:
             proc = subprocess.run(
-                ["yt-dlp", "--no-warnings", "--skip-download", "--flat-playlist",
-                 "--dump-single-json", *_ytdl_site_flags(), f"{prefix}{limit}:{q}"],
+                ["yt-dlp", "--no-warnings", "--skip-download", "--flat-playlist", "--dump-single-json",
+                 *_ytdl_site_flags(), f"scsearch{limit}:{q}"],
                 capture_output=True, text=True, timeout=22,
             )
-            if proc.returncode != 0 or not proc.stdout.strip():
-                log.warning("%s search failed: %s", provider, (proc.stderr or "")[-250:])
-                continue
-            data = json.loads(proc.stdout)
-            entries = data.get("entries") or [data]
-            for item in entries:
-                url = item.get("webpage_url") or item.get("url")
-                if url and not str(url).startswith(("http://", "https://")):
-                    if "youtube" in provider.lower() and item.get("id"):
-                        url = "https://www.youtube.com/watch?v=" + item["id"]
-                    else:
+            if proc.returncode == 0 and proc.stdout.strip():
+                data = json.loads(proc.stdout)
+                for item in data.get("entries") or [data]:
+                    url = item.get("webpage_url") or item.get("url")
+                    if url and not str(url).startswith(("http://", "https://")):
                         continue
-                add(item.get("title"), url, item.get("duration_string") or item.get("duration") or "",
-                    item.get("thumbnail") or "", provider)
-        except subprocess.TimeoutExpired:
-            log.warning("%s search timed out; moving to next provider", provider)
+                    add(item.get("title"), url, item.get("duration_string") or item.get("duration") or "",
+                        item.get("thumbnail") or "", "SoundCloud")
+            else:
+                log.warning("SoundCloud search failed: %s", (proc.stderr or "")[-250:])
         except Exception as exc:
-            log.warning("%s search provider error: %s", provider, exc)
-    return candidates
+            log.warning("SoundCloud search error: %s", exc)
+
+    if selected in ("auto", "archive") and len(candidates) < limit:
+        for item in _internet_archive_search(q, limit - len(candidates)):
+            add(*item)
+
+    if selected in ("bandcamp", "audiomack", "mixcloud") and not candidates:
+        log.info("%s supports direct track links; keyword search is not available through yt-dlp", _PROVIDER_OPTIONS[selected])
+    return candidates[:limit]
 
 
-_YT_RE = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/")
-_SOUNDCLOUD_RE = re.compile(r"https?://(www\.)?soundcloud\.com/", re.I)
-
-
-async def _download_soundcloud(link: str):
-    """Download SoundCloud audio locally instead of feeding a short-lived URL to FFmpeg.
-
-    Some SoundCloud stream URLs resolve successfully in yt-dlp but then produce an
-    immediate EOF in the NTgCalls FFmpeg reader. A local file avoids that direct-URL
-    playback path and makes extraction/download failures visible in the logs.
-    """
+async def _download_provider_audio(link: str):
+    """Download supported provider audio locally before passing it to NTgCalls."""
     started_at = time()
     downloads = Path("downloads")
     downloads.mkdir(parents=True, exist_ok=True)
-    log.info("Downloading SoundCloud track locally before playback: %s", link[:180])
+    host = link.lower().split("/")[2] if "://" in link else "unknown"
+    log.info("Downloading provider audio locally: host=%s url=%s", host, link[:160])
     try:
         proc = await asyncio.create_subprocess_exec(
             "yt-dlp", "--no-warnings", "--no-playlist", "--no-part", "--newline",
-            *_ytdl_site_flags(),
-            "-f", "bestaudio/best",
+            *_ytdl_site_flags(), "-f", "bestaudio/best",
             "-o", str(downloads / "%(extractor)s-%(id)s.%(ext)s"),
-            "--print", "after_move:filepath",
-            link,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            "--print", "after_move:filepath", link,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-    except Exception:
-        log.exception("Could not launch yt-dlp for SoundCloud download")
-        return 0, "Could not start yt-dlp for SoundCloud download."
-    try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
     except asyncio.TimeoutError:
-        log.warning("SoundCloud download timed out after 120s")
+        log.warning("Provider audio download timed out after 120s: %s", link[:160])
         proc.kill()
         await proc.wait()
-        return 0, "SoundCloud audio download timed out after 120 seconds."
+        return 0, "Audio download timed out after 120 seconds."
+    except Exception:
+        log.exception("Could not start provider audio download")
+        return 0, "Could not start audio downloader."
     elapsed = time() - started_at
     lines = [line.strip() for line in stdout.decode(errors="ignore").splitlines() if line.strip()]
     local_path = Path(lines[-1]) if lines else None
     if proc.returncode == 0 and local_path and local_path.is_file() and local_path.stat().st_size > 16_000:
-        log.info("SoundCloud audio downloaded locally in %.1fs (%s bytes): %s", elapsed, local_path.stat().st_size, local_path)
+        log.info("Provider audio downloaded locally in %.1fs (%s bytes): %s", elapsed, local_path.stat().st_size, local_path)
         return 1, str(local_path.resolve())
     err = stderr.decode(errors="ignore")[-700:]
-    log.warning("SoundCloud local download failed (exit=%s, %.1fs): %s", proc.returncode, elapsed, err or "no output file")
-    return 0, (err or "SoundCloud download did not produce a valid audio file.")
+    log.warning("Provider download failed (exit=%s, %.1fs): %s", proc.returncode, elapsed, err or "no output file")
+    return 0, err or "Provider did not produce a valid audio file."
 
 
 async def ytdl(format: str, link: str, status_msg=None):
-    if _SOUNDCLOUD_RE.match(link):
-        return await _download_soundcloud(link)
-    # For non-YouTube sites (e.g. Rutube) the formats are HLS-only muxed streams
-    # that would require downloading gigabytes before playback.  Instead, extract
-    # the direct stream URL and hand it to ffmpeg live (same as radio).
-    # YouTube must still be downloaded first because its URLs 403 ffmpeg directly.
-    if not _YT_RE.match(link):
-        started_at = time()
-        log.info("Starting yt-dlp stream resolution for non-YouTube URL: %s", link[:180])
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "yt-dlp", "--no-warnings", "--no-playlist",
-                *_ytdl_site_flags(),
-                "-f", "worstaudio/worst",
-                "--print", "%(url)s",
-                link,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-        except Exception:
-            log.exception("Could not launch yt-dlp for URL %s", link[:180])
-            return 0, "Could not start yt-dlp; check the Railway runtime and executable path."
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=35)
-        except asyncio.TimeoutError:
-            log.warning("yt-dlp stream resolution timed out after 35s: %s", link[:180])
-            proc.kill()
-            await proc.wait()
-            return 0, "Provider timed out while resolving the audio stream (35 seconds)."
-        elapsed = time() - started_at
-        if proc.returncode == 0:
-            # --print may emit more than one line; the final non-empty line is the URL.
-            lines = [line.strip() for line in stdout.decode(errors="ignore").splitlines() if line.strip()]
-            url = lines[-1] if lines else ""
-            if url.startswith(("https://", "http://")):
-                log.info("yt-dlp resolved audio stream in %.1fs", elapsed)
-                return 1, url
-        err = stderr.decode(errors="ignore")[-400:]
-        log.warning("yt-dlp stream resolution failed (exit=%s, %.1fs): %s", proc.returncode, elapsed, err or "no stderr")
-        return 0, (err or "stream URL extraction failed")
-
-    proc = await asyncio.create_subprocess_exec(
-        "yt-dlp",
-        "--no-warnings",
-        "--no-playlist",
-        *_ytdl_site_flags(),
-        *(["--sponsorblock-remove", SPONSORBLOCK_REMOVE] if SPONSORBLOCK_REMOVE else []),
-        "--no-simulate",
-        "--newline",
-        "--progress-template",
-        "download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-        # Use yt-dlp's current default YouTube clients; hard-coded legacy clients
-        # can trigger reload/SABR errors and hide audio formats.
-        *(_youtube_client_args() if _YT_RE.match(link) else []),
-        "--print",
-        "after_move:filepath",
-        "-f",
-        "bestaudio/best",
-        "-o",
-        "downloads/%(id)s.%(ext)s",
-        f"{link}",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    stderr_buf = []
-
-    async def _drain_stderr():
-        while True:
-            chunk = await proc.stderr.readline()
-            if not chunk:
-                break
-            stderr_buf.append(chunk.decode(errors="ignore"))
-
-    stderr_task = asyncio.ensure_future(_drain_stderr())
-
-    path = ""
-    last_edit = 0.0
-    while True:
-        try:
-            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=75)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            await stderr_task
-            return 0, "YouTube download timed out after 75 seconds; trying another provider."
-        if not raw:
-            break
-        line = raw.decode(errors="ignore").strip()
-        if not line:
-            continue
-        if line.startswith("PROG|"):
-            if status_msg is not None and time() - last_edit >= 3:
-                last_edit = time()
-                parts = line.split("|")
-                pct = parts[1].strip() if len(parts) > 1 else ""
-                spd = parts[2].strip() if len(parts) > 2 else ""
-                eta = parts[3].strip() if len(parts) > 3 else ""
-                try:
-                    await status_msg.edit(
-                        f"📥 **Downloading from YouTube…** `{pct}`\n({spd}, ETA {eta})"
-                    )
-                except Exception:
-                    pass
-        else:
-            path = line  # --print after_move:filepath is the last line on success
-    await proc.wait()
-    await stderr_task
-    if proc.returncode == 0 and path:
-        return 1, path
-    return 0, ("".join(stderr_buf)[-500:] or "download failed")
+    if _YOUTUBE_RE.match(link):
+        return 0, "YouTube is disabled for music. Use a SoundCloud or Internet Archive search, or a supported provider link."
+    return await _download_provider_audio(link)
 
 
 async def find_and_download_music(query: str, status_msg=None):
-    """Search multiple catalogs and try candidates until one streams/downloads."""
+    """Search supported non-YouTube catalogs and try candidates until one downloads."""
     # Search providers in a worker thread so a slow external search cannot block Telegram updates.
     log.info("Starting music search for query=%r", query[:120])
     candidates = await asyncio.to_thread(ytsearch_all, query, 5)
     log.info("Music search returned %d candidate(s)", len(candidates))
     if not candidates:
-        return None, "No results found across YouTube and SoundCloud."
+        return None, "No results found on SoundCloud or Internet Archive. Try a direct SoundCloud, Bandcamp, Audiomack, Mixcloud, or Internet Archive audio link."
     errors = []
     for index, candidate in enumerate(candidates, start=1):
         title, url, duration, thumbnail, provider = candidate
@@ -363,7 +263,7 @@ async def find_and_download_music(query: str, status_msg=None):
             if status_msg is not None:
                 await status_msg.edit(f"🔎 **Trying {provider or 'music provider'}** ({index}/{len(candidates)})…\n\n🏷 `{title[:70]}`")
             # A single extractor must never leave the request stuck indefinitely.
-            attempt_timeout = 145 if _SOUNDCLOUD_RE.match(url) else 85
+            attempt_timeout = 125
             try:
                 ok, result = await asyncio.wait_for(
                     ytdl("bestaudio/best", url, status_msg), timeout=attempt_timeout
@@ -395,7 +295,7 @@ async def provider_command(c: Client, m: Message):
             for key, label in _PROVIDER_OPTIONS.items()]
     await m.reply_text(
         f"🎵 **Music provider settings**\\n\\nCurrent: **{_PROVIDER_OPTIONS[current]}**\\n"
-        "Choose a preferred source. If it fails, the bot will try other sources.",
+        "SoundCloud and Internet Archive support keyword search. Bandcamp, Audiomack, and Mixcloud accept direct links.",
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
@@ -416,7 +316,7 @@ async def provider_callback(c, query):
     try:
         await query.edit_message_text(
             f"🎵 **Music provider settings**\\n\\nCurrent: **{_PROVIDER_OPTIONS[value]}**\\n"
-            "Other supported sources remain available as fallback.",
+            "SoundCloud and Internet Archive support keyword search; Bandcamp, Audiomack, and Mixcloud accept direct links.",
             reply_markup=InlineKeyboardMarkup(rows),
         )
     except Exception:

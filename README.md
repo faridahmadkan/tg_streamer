@@ -4,8 +4,8 @@ A Telegram music/video streaming bot that preserves the original Python + Pyrogr
 
 ## Features retained
 
-- Music and video streaming in Telegram group voice chats from YouTube searches/URLs, Telegram media, and live links.
-- YouTube search picker, radio stations, IPTV catalogue, local media library, recording, screenshots, inline now-playing controls, queue controls, pause/resume/skip/seek, volume/mute, loop/shuffle/clear, autoplay, resume after restart, idle auto-leave, custom extractors, optional browser fallback, and the original plugins.
+- Music streaming in Telegram group voice chats from SoundCloud and Internet Archive searches, supported audio-provider links, Telegram media, and live links.
+- SoundCloud and Internet Archive music search, Bandcamp/Audiomack/Mixcloud direct links, radio stations, IPTV catalogue, local media library, recording, screenshots, inline now-playing controls, queue controls, pause/resume/skip/seek, volume/mute, loop/shuffle/clear, resume after restart, idle auto-leave, custom extractors, optional browser fallback, and the original plugins.
 - Per-user rate limiting and maximum queue size.
 
 ## Access rules
@@ -88,42 +88,19 @@ Open `http://localhost:3000/health` (or the port in `PORT`) to check the service
 - Use only media you have permission to stream or download, and comply with Telegram and source-service terms.
 
 
-### YouTube HTTP 403 troubleshooting
+### Music providers
 
-The bot uses the YouTube TV player client for audio/video extraction and
-does not force a desktop browser User-Agent onto that client. yt-dlp is installed
-from `requirements.txt`; redeploy after updating dependencies. YouTube can still
-block datacenter IPs or require account cookies for some videos. If 403 persists,
-set `COOKIES_BASE64` to a Base64-encoded Netscape-format `cookies.txt` exported
-from your own signed-in browser session (keep it secret; never commit it), or try
-a different hosting region/network. Cookies cannot guarantee access to private,
-age-restricted, or otherwise unavailable videos.
-
-
-### YouTube “The page needs to be reloaded” errors
-
-The app no longer pins YouTube to a legacy `tv` player client. It lets the current
-yt-dlp release select its supported clients and upgrades yt-dlp during Nixpacks
-installation. After deploying, trigger a clean rebuild (clear the build cache) so
-the updated downloader is installed. If YouTube still rejects extraction, update
-yt-dlp again and configure valid cookies from your own account; YouTube can block
-cloud-hosting IPs independently of the bot code.
-
+YouTube is disabled in the music search/playback path. `/play` and `/search` search SoundCloud and Internet Archive; music URLs from SoundCloud, Bandcamp, Audiomack, Mixcloud, and Internet Archive are also accepted. Tracks are downloaded to a local file before PyTgCalls starts playback to avoid short-lived stream URLs ending immediately. SoundCloud and Internet Archive support keyword search in this build; Bandcamp, Audiomack, and Mixcloud are supported through direct track links. Availability depends on each provider, network access, and rights/access restrictions; use tracks you are authorized to play.
 
 ## Music provider selection
 
-Bot admins can use `/provider` in Telegram to choose **Auto**, **YouTube**, **YouTube Music**, **SoundCloud**, or **Google Videos**. The selected catalog is prioritized; if it fails, the bot searches the remaining catalogs as fallbacks. The preference is saved to `data/music_provider.json` on the host filesystem. On ephemeral hosting, persist the `data/` directory with a volume if you want this setting to survive restarts. Provider availability depends on yt-dlp support, network access, and each service's restrictions; no provider can guarantee every track.
+Configured bot administrators (`SUDO_USERS` in the environment) can send `/provider` to select:
+- **Auto**: search SoundCloud, then Internet Archive as a fallback.
+- **SoundCloud**: keyword search on SoundCloud.
+- **Internet Archive**: search its audio catalog; results may include public-domain or rights-holder-uploaded recordings, so check each item's terms.
+- **Bandcamp**, **Audiomack**, and **Mixcloud**: supported by direct track/mix links in this build; keyword search is not available for these through this bot.
 
-### Music provider selection
-
-Configured bot administrators (`SUDO_USERS` in the environment) can send `/provider` in Telegram to choose a preferred source:
-- **Auto (fallback)**: tries the supported search sources.
-- **YouTube** / **YouTube Music**: prioritizes YouTube search results.
-- **SoundCloud**: prioritizes SoundCloud search results.
-- **Google Videos**: prioritizes yt-dlp's Google Videos search.
-
-A selected provider is a preference, not a hard lock: if it fails, the bot tries other available sources. The setting is stored in `data/music_provider.json`; use persistent storage for the `data/` directory if your hosting filesystem is ephemeral. YouTube Music and YouTube share underlying YouTube delivery, so they are separate preferences rather than independent audio hosts.
-
+The preference is stored in `data/music_provider.json`. On ephemeral hosting, it may reset after a restart unless `data/` is on persistent storage. YouTube URLs are rejected by the music playback path.
 
 ### Railway music playback diagnostics
 
@@ -132,7 +109,7 @@ This build logs the PyTgCalls startup result and the music-resolution lifecycle.
 - `pytgcalls client started successfully` — confirms the PyTgCalls start call returned.
 - `Starting music search` and `Music search returned ... candidate(s)` — confirms the search stage ran.
 - `Candidate ... provider=SoundCloud` — identifies the exact URL/provider being resolved.
-- `yt-dlp stream resolution timed out after 35s` or `Candidate timed out after 85s` — identifies a resolver timeout.
-- `Candidate resolved successfully` — confirms the stream resolver returned media successfully; if audio still does not play, investigate the subsequent Telegram playback stage.
+- `Provider download timed out after 120s` or `Candidate timed out after 125s` — identifies a provider timeout.
+- `Provider audio downloaded locally` and `Candidate resolved successfully` — confirm the local audio file was created; if audio still does not play, investigate the subsequent Telegram playback stage.
 
 Please redact bot tokens, API hashes, session strings, cookies, and other credentials before sharing logs.

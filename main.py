@@ -21,10 +21,10 @@ import program.iptv  # registers /iptv handlers
 
 BOT_COMMANDS = [
     BotCommand("provider", "choose music search provider (bot admin)"),
-    BotCommand("play", "play music from YouTube, or reply to an audio"),
+    BotCommand("play", "play music from supported audio providers or Telegram audio"),
     BotCommand("vplay", "play video from YouTube, or reply to a video"),
     BotCommand("vstream", "stream a live / m3u8 / YouTube link"),
-    BotCommand("search", "search YouTube and pick a result to play"),
+    BotCommand("search", "search SoundCloud and Internet Archive music"),
     BotCommand("library", "browse the local media library + web-sourced cartoons"),
     BotCommand("lplay", "play a local library file by name"),
     BotCommand("radio", "tune in to an internet radio station"),
@@ -48,7 +48,7 @@ BOT_COMMANDS = [
     BotCommand("info", "now playing + controls"),
     BotCommand("screenshot", "screenshot the current video"),
     BotCommand("help", "show the command list"),
-    BotCommand("song", "download a song from YouTube"),
+    BotCommand("song", "download audio from supported music providers"),
     BotCommand("video", "download a video from YouTube"),
     BotCommand("userbotjoin", "make the assistant join this group"),
     BotCommand("userbotleave", "make the assistant leave this group"),

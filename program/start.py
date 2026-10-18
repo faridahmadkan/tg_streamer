@@ -135,7 +135,7 @@ async def help_cmd(client: Client, message: Message):
     await message.reply_text(
         f"📖 **{BOT_NAME} — commands**\n\n"
         "**▶️ Play**\n"
-        "• `/play <query|YouTube URL>` — music (or reply to an audio file)\n"
+        "• `/play <song name|supported audio URL>` — music (or reply to an audio file)\n"
         "• `/provider` — choose the preferred music source (admins)\n"
         "• `/vplay <query|URL> [720|480|360] [mute]` — video (or reply to a video)\n"
         "• `/vstream <link>` — live / m3u8 / YouTube-live\n"
@@ -143,7 +143,7 @@ async def help_cmd(client: Client, message: Message):
         "• `/radio` — internet radio stations\n"
         "• `/iptv <name>` — live TV (iptv-org catalogue, 50k+ channels) · `/iptv` for links\n"
         "• `/record [duration]` · `/record 01:30:00 02:00:00` — record or clip a range · `/stoprec`\n"
-        "• `/search <query>` — pick from YouTube results (🎵 audio / 🎬 video)\n"
+        "• `/search <query>` — search SoundCloud and Internet Archive music\n"
         "• `/song <query>` · `/video <query>` — download instead of stream\n\n"
         "**🎛 Controls** (admins)\n"
         "• `/pause` `/resume` `/skip` `/stop`\n"

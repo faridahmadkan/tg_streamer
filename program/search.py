@@ -7,11 +7,9 @@ from driver.filters import command, other_filters, access_filter
 from driver.queues import QUEUE, add_to_queue, drop_if_live, set_active_thread
 from driver.clients import call_py
 from config import MAX_QUEUE_SIZE
-from driver.utils import control_panel, media_audio, media_video, ensure_can_play
-from driver.transcode import prepare_for_stream
+from driver.utils import control_panel, media_audio, ensure_can_play
 from program.music import ytdl as _audio_dl
-from program.video import ytdl as _video_dl
-from youtubesearchpython import VideosSearch
+from program.music import ytsearch_all
 from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -21,17 +19,17 @@ SEARCH = {}
 
 def _results(query, n=6):
     try:
-        data = VideosSearch(query, limit=n).result().get("result", [])
-        return [(d["title"], d["link"], d.get("duration") or "") for d in data]
+        data = ytsearch_all(query, n)
+        return [(item[0], item[1], item[2], item[4]) for item in data]
     except Exception:
         return []
 
 
-@Client.on_message(command(["search", f"search@{BOT_USERNAME}", "ytsearch", "yts"]) & other_filters)
+@Client.on_message(command(["search", f"search@{BOT_USERNAME}", "musicsearch", "ms"]) & other_filters)
 @errors
 async def search_cmd(c: Client, m: Message):
     if len(m.command) < 2:
-        return await m.reply("» Usage: /search song or video name", parse_mode=None)
+        return await m.reply("» Usage: /search song name or supported audio URL", parse_mode=None)
     query = m.text.split(None, 1)[1]
     loading = await m.reply("🔍 **Searching…**")
     res = await asyncio.to_thread(_results, query)
@@ -39,15 +37,14 @@ async def search_cmd(c: Client, m: Message):
         return await loading.edit("🔍 no results found.")
     SEARCH[m.chat.id] = res
     rows = []
-    for i, (title, _url, dur) in enumerate(res):
-        label = f"🎵 {title[:34]}" + (f" · {dur}" if dur else "")
-        rows.append([
-            InlineKeyboardButton(label[:58], callback_data=f"sa:{i}"),
-            InlineKeyboardButton("🎬", callback_data=f"sv:{i}"),
-        ])
+    for i, (title, _url, dur, provider) in enumerate(res):
+        label = f"🎵 {title[:30]}"
+        if dur:
+            label += f" · {dur}"
+        rows.append([InlineKeyboardButton(label[:58], callback_data=f"sa:{i}")])
     rows.append([InlineKeyboardButton("🗑 Close", callback_data="cls")])
     await loading.edit(
-        f"🔍 **Results for** `{query[:50]}`\nTap 🎵 for audio or 🎬 for video:",
+        f"🔍 **Results for** `{query[:50]}`\nTap a result to play audio:",
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
@@ -55,7 +52,8 @@ async def search_cmd(c: Client, m: Message):
 async def _play_choice(c, query, video):
     res = SEARCH.get(query.message.chat.id)
     try:
-        title, url, _dur = res[int(query.data.split(":")[1])]
+        choice = res[int(query.data.split(":")[1])]
+        title, url, _dur = choice[:3]
     except (TypeError, IndexError, ValueError):
         return await query.answer("results expired — search again", show_alert=True)
     chat_id = query.message.chat.id
@@ -101,7 +99,3 @@ async def search_audio_cb(c: Client, query: CallbackQuery):
     await _play_choice(c, query, video=False)
 
 
-@Client.on_callback_query(filters.regex(r"^sv:") & access_filter)
-@errors_cb
-async def search_video_cb(c: Client, query: CallbackQuery):
-    await _play_choice(c, query, video=True)
