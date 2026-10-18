@@ -167,10 +167,17 @@ async def ytdl(format: str, link: str, status_msg=None):
             link,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=35)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return 0, "Provider timed out while resolving the audio stream (35 seconds)."
         if proc.returncode == 0:
-            url = stdout.decode(errors="ignore").strip()
-            if url:
+            # --print may emit more than one line; the final non-empty line is the URL.
+            lines = [line.strip() for line in stdout.decode(errors="ignore").splitlines() if line.strip()]
+            url = lines[-1] if lines else ""
+            if url.startswith(("https://", "http://")):
                 return 1, url
         err = stderr.decode(errors="ignore")[-400:]
         return 0, (err or "stream URL extraction failed")
@@ -213,7 +220,13 @@ async def ytdl(format: str, link: str, status_msg=None):
     path = ""
     last_edit = 0.0
     while True:
-        raw = await proc.stdout.readline()
+        try:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=75)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            await stderr_task
+            return 0, "YouTube download timed out after 75 seconds; trying another provider."
         if not raw:
             break
         line = raw.decode(errors="ignore").strip()
@@ -252,7 +265,13 @@ async def find_and_download_music(query: str, status_msg=None):
         try:
             if status_msg is not None:
                 await status_msg.edit(f"🔎 **Trying {provider or 'music provider'}** ({index}/{len(candidates)})…\n\n🏷 `{title[:70]}`")
-            ok, result = await ytdl("bestaudio/best", url, status_msg)
+            # A single extractor must never leave the request stuck indefinitely.
+            try:
+                ok, result = await asyncio.wait_for(
+                    ytdl("bestaudio/best", url, status_msg), timeout=85
+                )
+            except asyncio.TimeoutError:
+                ok, result = 0, "Provider attempt timed out after 85 seconds."
             if ok:
                 return {"title": title, "url": url, "duration": duration,
                         "thumbnail": thumbnail, "provider": provider, "media": result}, None
