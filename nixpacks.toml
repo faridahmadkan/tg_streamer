@@ -2,7 +2,16 @@
 providers = ["node"]
 
 [phases.setup]
-nixPkgs = ["nodejs", "python311", "ffmpeg", "gcc", "pkg-config", "git"]
+nixPkgs = [
+  "nodejs",
+  "python311",
+  "ffmpeg",
+  "yt-dlp",
+  "gcc",
+  "pkg-config",
+  "git"
+]
+
 nixLibs = ["stdenv.cc.cc.lib"]
 
 [phases.install]
