@@ -40,7 +40,7 @@ _DEFAULT_USER_AGENT = (
 
 
 def _ytdl_site_flags():
-    """Build extra yt-dlp flags for non-YouTube sites (cookies, user-agent, proxy)."""
+    """Build common yt-dlp flags; cookies are also applied to YouTube."""
     flags = ["--socket-timeout", "60"]
     if COOKIES_FILE:
         flags += ["--cookies", COOKIES_FILE]
@@ -48,6 +48,12 @@ def _ytdl_site_flags():
     if PROXY_URL:
         flags += ["--proxy", PROXY_URL]
     return flags
+
+
+def _youtube_client_args():
+    """Use the web client when cookies are configured; otherwise use android."""
+    client = "web" if COOKIES_FILE else "android"
+    return ["--extractor-args", f"youtube:player_client={client}"]
 
 
 def ytsearch(query: str):
@@ -58,8 +64,7 @@ def ytsearch(query: str):
             # any direct URL — use yt-dlp for metadata (handles YouTube, Rutube, Vimeo, …)
             cmd = ["yt-dlp", "--no-warnings", "--skip-download",
                    "--print", "%(title)s\x1f%(duration_string)s\x1f%(id)s\x1f%(thumbnail)s"]
-            if not is_yt:
-                cmd += _ytdl_site_flags()
+            cmd += _ytdl_site_flags()
             cmd.append(q)
             out = subprocess.run(
                 cmd,
@@ -177,15 +182,14 @@ async def ytdl(link, status_msg=None):
         "yt-dlp",
         "--no-warnings",
         "--no-playlist",
+        *_ytdl_site_flags(),
         *(["--sponsorblock-remove", SPONSORBLOCK_REMOVE] if SPONSORBLOCK_REMOVE else []),
         "--no-simulate",
         "--newline",
         "--progress-template",
         "download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-        # android_vr client avoids YouTube's SABR-gating (the default clients
-        # only offer the progressive itag-18 stream, which 403s).
-        *(["--extractor-args", "youtube:player_client=android"]
-          if _YT_RE.match(link) else []),
+        # Cookies require the web client; without cookies use android client.
+        *(_youtube_client_args() if _YT_RE.match(link) else []),
         # Prefer H.264 video + AAC(m4a) audio so the merge produces a universally
         # playable, light-to-stream mp4 (avoids AV1/VP9/Opus -> mp4 issues).
         "-f",
