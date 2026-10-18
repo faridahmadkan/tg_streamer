@@ -1,0 +1,26 @@
+*.session
+*.session-journal
+.env
+__pycache__
+.idea
+.vscode
+raw_files
+downloads
+venv
+local.env
+*.session
+*.jpg
+*png
+*.raw
+*.log
+reality-vpn.json
+docker-compose.override.yml
+*.bak
+*.bak-*
+*.orig
+resolv.conf
+
+# Custom extractor plugins (user-supplied; may be site-specific — keep private)
+/plugins/*
+!/plugins/.gitkeep
+.session-env/

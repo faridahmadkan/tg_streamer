@@ -1,0 +1,94 @@
+import asyncio
+from driver.clients import user
+from driver.utils import ensure_assistant_in_chat
+from pyrogram.types import Message
+from pyrogram import Client, filters
+from config import BOT_USERNAME, SUDO_USERS
+from driver.filters import command, other_filters
+from pyrogram.errors import UserAlreadyParticipant, UserNotParticipant, PeerIdInvalid
+from pyrogram.types import ChatPrivileges
+from driver.decorators import authorized_users_only, sudo_users_only, errors
+
+
+@Client.on_message(
+    command(["userbotjoin", f"userbotjoin@{BOT_USERNAME}"]) & ~filters.private & ~filters.bot
+)
+@errors
+@authorized_users_only
+async def join_chat(c: Client, m: Message):
+    chat_id = m.chat.id
+    ubot_id = (await user.get_me()).id
+    # make the assistant join (no-op if it's already a member)
+    ok, reason = await ensure_assistant_in_chat(c, chat_id, m.chat.username)
+    if not ok:
+        return await m.reply(f"❌ **userbot failed to join**\n\n**reason**: `{reason}`")
+    # optional: promote it (needed only for /volume). The bot may not be able to
+    # resolve the assistant peer yet (PeerIdInvalid) — that's fine, skip quietly.
+    try:
+        await m.chat.promote_member(
+            ubot_id, privileges=ChatPrivileges(can_manage_video_chats=True)
+        )
+    except Exception:
+        pass
+    return await user.send_message(chat_id, "✅ userbot is in the chat")
+
+
+@Client.on_message(command(["userbotleave",
+                            f"leave@{BOT_USERNAME}"]) & filters.group
+)
+@errors
+@authorized_users_only
+async def leave_chat(_, m: Message):
+    chat_id = m.chat.id
+    try:
+        await user.leave_chat(chat_id)
+        return await _.send_message(
+            chat_id,
+            "✅ userbot leaved chat",
+        )
+    except UserNotParticipant:
+        return await _.send_message(
+            chat_id,
+            "❌ userbot already leave chat",
+        )
+
+
+@Client.on_message(command(["leaveall", f"leaveall@{BOT_USERNAME}"]))
+@errors
+@sudo_users_only
+async def leave_all(client, message):
+    if message.from_user.id not in SUDO_USERS:
+        return
+
+    left = 0
+    failed = 0
+    lol = await message.reply("🔄 **userbot** leaving all chats !")
+    async for dialog in user.get_dialogs():
+        try:
+            await user.leave_chat(dialog.chat.id)
+            left += 1
+            await lol.edit(
+                f"Userbot leaving all group...\n\nLeft: {left} chats.\nFailed: {failed} chats."
+            )
+        except BaseException:
+            failed += 1
+            await lol.edit(
+                f"Userbot leaving...\n\nLeft: {left} chats.\nFailed: {failed} chats."
+            )
+        await asyncio.sleep(0.7)
+    await client.send_message(
+        message.chat.id, f"✅ Left from: {left} chats.\n❌ Failed in: {failed} chats."
+    )
+
+
+@Client.on_message(filters.left_chat_member)
+@errors
+async def ubot_leave(c: Client, m: Message):
+    ass_id = (await user.get_me()).id
+    bot_id = (await c.get_me()).id
+    chat_id = m.chat.id
+    left_member = m.left_chat_member
+    if left_member.id == bot_id:
+        await user.leave_chat(chat_id)
+    elif left_member.id == ass_id:
+        await c.leave_chat(chat_id)

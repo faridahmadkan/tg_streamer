@@ -1,0 +1,13 @@
+{
+  "name": "tg-streaming-bot-web-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js health web service supervising the original Python Telegram voice-chat streaming engine",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

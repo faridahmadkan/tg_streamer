@@ -1,0 +1,604 @@
+from pyrogram.types import LinkPreviewOptions
+import os
+import re
+import asyncio
+import logging
+from time import time
+from config import DOWNLOADS_CACHE_LIMIT_MB, ASSISTANT_NAME
+from driver.clients import bot, call_py, user
+from driver.queues import QUEUE, clear_queue, get_queue, pop_an_item, is_loop, is_autoplay, add_to_queue, get_active_thread
+from pytgcalls import filters as call_filters
+from pytgcalls.types import MediaStream, AudioQuality, VideoQuality, ChatUpdate, StreamEnded
+from pyrogram.enums import ChatMemberStatus, ChatMembersFilter
+from pyrogram.errors import UserAlreadyParticipant, UserNotParticipant, PeerIdInvalid
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from pyrogram import Client, filters
+
+log = logging.getLogger(__name__)
+
+_VQ = {720: VideoQuality.HD_720p, 480: VideoQuality.SD_480p, 360: VideoQuality.SD_360p}
+
+
+# HTTP headers (Referer/Origin/…) a resolver — an extractor plugin or the
+# headless-browser fallback — says a stream URL needs. Keyed by media URL so the
+# many media_* call sites don't change: ffmpeg gets them via MediaStream(headers=).
+_STREAM_HEADERS = {}
+
+
+def remember_stream_headers(url, headers):
+    if headers:
+        _STREAM_HEADERS[str(url)] = dict(headers)
+
+
+def _stream_kwargs(path):
+    """MediaStream kwargs for a resolver-provided URL (empty for everything else)."""
+    return {"headers": _STREAM_HEADERS[str(path)]} if str(path) in _STREAM_HEADERS else {}
+
+
+# Plugins may hand back a local ``file://`` media playlist that lists remote
+# segments — ffmpeg refuses that unless the protocol whitelist is widened.
+_LOCAL_PLAYLIST_PARAMS = "-protocol_whitelist file,http,https,tcp,tls,crypto"
+
+
+def _input_params(path):
+    return _LOCAL_PLAYLIST_PARAMS if str(path).startswith("file://") else None
+
+
+def _join_params(*parts):
+    joined = " ".join(p for p in parts if p)
+    return joined or None
+
+
+def media_audio(path):
+    """Audio-only MediaStream (ignore the video track)."""
+    return MediaStream(
+        path, video_flags=MediaStream.Flags.IGNORE,
+        ffmpeg_parameters=_input_params(path), **_stream_kwargs(path),
+    )
+
+
+def media_video(path, quality=720):
+    """Audio+video MediaStream at the given vertical resolution."""
+    return MediaStream(
+        path,
+        audio_parameters=AudioQuality.HIGH,
+        video_parameters=_VQ.get(quality, VideoQuality.HD_720p),
+        ffmpeg_parameters=_input_params(path),
+        **_stream_kwargs(path),
+    )
+
+
+def _gain_params(vol, pos=0):
+    """py-tgcalls ffmpeg-parameter DSL string that applies an audio `volume`
+    filter *after* `-i` (--audio ---mid section) and optionally an input seek.
+    Two dashes select the section, three select the start/mid/end slot."""
+    af = f"--audio ---mid -af volume={max(0.0, vol):.3f}"
+    return f"-ss {int(pos)} {af}" if pos and pos > 0 else af
+
+
+def media_audio_gain(path, vol, pos=0):
+    return MediaStream(
+        path, video_flags=MediaStream.Flags.IGNORE,
+        ffmpeg_parameters=_join_params(_input_params(path), _gain_params(vol, pos)),
+        **_stream_kwargs(path),
+    )
+
+
+def media_video_gain(path, quality, vol, pos=0):
+    return MediaStream(
+        path,
+        audio_parameters=AudioQuality.HIGH,
+        video_parameters=_VQ.get(quality, VideoQuality.HD_720p),
+        ffmpeg_parameters=_join_params(_input_params(path), _gain_params(vol, pos)),
+        **_stream_kwargs(path),
+    )
+
+
+# Absolute playback offset of the last (re)feed per chat. call_py.time() resets
+# to 0 on every play(), so to seek a re-fed stream back to the live spot across
+# *repeated* re-feeds we track the offset ourselves: base + elapsed-since-feed.
+_GAIN_BASE = {}  # chat_id -> {"src": str, "base": int(seconds)}
+
+
+async def current_position(chat_id, src):
+    """Best-effort absolute playback position (seconds) of the current local
+    stream. call_py.time() resets to 0 on every play(), so add the offset of the
+    last re-feed (tracked in _GAIN_BASE) to the elapsed time since it."""
+    prev = _GAIN_BASE.get(chat_id)
+    base = prev["base"] if prev and prev.get("src") == src else 0
+    try:
+        delta = int(await call_py.time(chat_id))
+    except Exception:
+        delta = 0
+    return base + max(0, delta)
+
+
+async def replay_at_gain(chat_id, vol_pct):
+    """Re-feed the current stream at vol_pct% loudness — the master-volume / mute
+    lever. Because it keeps the assistant continuously streaming (rather than
+    muting at the media layer), muting a video this way (vol 0) doesn't make
+    Telegram downgrade it to a blurry low-quality layer. Costs a brief re-buffer."""
+    vol = max(0, vol_pct) / 100.0
+    # Radio uses an image+audio_path stream; let radio rebuild it (keeps the card).
+    try:
+        from program.radio import replay_radio_at_gain
+        if await replay_radio_at_gain(chat_id, vol):
+            return True
+    except Exception:
+        pass
+    q = get_queue(chat_id)
+    if not q:
+        return False
+    src, typ, quality = q[0][1], q[0][3], q[0][4]
+    pos = 0
+    if not str(src).startswith("http"):   # seek local files back to the live spot
+        pos = await current_position(chat_id, src)
+    stream = media_video_gain(src, quality, vol, pos) if typ == "Video" else media_audio_gain(src, vol, pos)
+    await call_py.play(chat_id, stream)
+    if not str(src).startswith("http"):
+        _GAIN_BASE[chat_id] = {"src": src, "base": pos}
+    log.info("re-fed %s at %s%% from %ss", chat_id, vol_pct, pos)
+    return True
+
+
+async def probe_duration(path):
+    """Duration of a media file in seconds (0.0 if unknown)."""
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "csv=p=0", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(p.communicate(), 20)
+        return float(out.decode().strip())
+    except Exception:
+        return 0.0
+
+
+async def seek_current(chat_id, seconds, vol_pct=100):
+    """Re-feed the current local stream from `seconds`, preserving vol_pct% gain
+    (the seek-to-% buttons). Live/radio can't be seeked — just re-applies gain."""
+    vol = max(0, vol_pct) / 100.0
+    try:
+        from program.radio import replay_radio_at_gain
+        if await replay_radio_at_gain(chat_id, vol):
+            return True
+    except Exception:
+        pass
+    q = get_queue(chat_id)
+    if not q:
+        return False
+    src, typ, quality = q[0][1], q[0][3], q[0][4]
+    pos = max(0, int(seconds)) if not str(src).startswith("http") else 0
+    stream = media_video_gain(src, quality, vol, pos) if typ == "Video" else media_audio_gain(src, vol, pos)
+    await call_py.play(chat_id, stream)
+    if not str(src).startswith("http"):
+        _GAIN_BASE[chat_id] = {"src": src, "base": pos}
+    return True
+
+
+async def capture_frame(chat_id):
+    """Grab the current frame of the playing video as a JPEG. Returns the path, or
+    None if nothing video is playing / capture failed."""
+    q = get_queue(chat_id)
+    if not q:
+        return None
+    src, typ = q[0][1], q[0][3]
+    if typ != "Video":
+        return None
+    pre = []
+    if not str(src).startswith("http"):
+        pos = await current_position(chat_id, src)
+        if pos > 0:
+            pre = ["-ss", str(int(pos))]
+    out = os.path.join("downloads", f"snap_{chat_id}.jpg")
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-nostdin", *pre, "-i", src, "-frames:v", "1", "-q:v", "2", out,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(p.wait(), 40)
+        if p.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            return out
+    except Exception:
+        pass
+    return None
+
+
+async def drop_stale_queue(chat_id) -> bool:
+    """If we think a chat is queued but py-tgcalls has no live call for it
+    (e.g. the stream silently died without firing a lifecycle event), clear the
+    stale queue so the next /play rejoins instead of queuing into a dead call."""
+    if chat_id not in QUEUE:
+        return False
+    try:
+        live = chat_id in (await call_py.calls)
+    except Exception:
+        live = False
+    if not live:
+        log.info("%s queued but no live call — clearing stale queue", chat_id)
+        clear_queue(chat_id)
+        return True
+    return False
+
+
+def can_manage_vc(member) -> bool:
+    """Pyrogram 2.x: owners implicitly have every right; admins need the
+    can_manage_video_chats privilege."""
+    if member.status == ChatMemberStatus.OWNER:
+        return True
+    if member.status == ChatMemberStatus.ADMINISTRATOR:
+        return bool(member.privileges and member.privileges.can_manage_video_chats)
+    return False
+
+
+async def get_assistant_member(c, chat_id, ubot_id):
+    """get_chat_member() for the assistant, tolerant of a cold peer cache.
+
+    A fresh bot session (new token, wiped downloads/bot.session) has never seen
+    the assistant, so the lookup raises PeerIdInvalid even when the assistant is
+    already in the chat -- which callers misread as "not a member" and then try
+    (and fail) to join via an invite link. Listing the admins makes the bot
+    resolve them; if the assistant still isn't found, PeerIdInvalid propagates."""
+    try:
+        return await c.get_chat_member(chat_id, ubot_id)
+    except PeerIdInvalid:
+        async for _ in c.get_chat_members(chat_id, filter=ChatMembersFilter.ADMINISTRATORS):
+            pass
+        return await c.get_chat_member(chat_id, ubot_id)
+
+
+async def ensure_assistant_in_chat(c, chat_id, chat_username=None):
+    """Make sure the assistant userbot is a member of the chat (auto-join via
+    public username or an exported invite link). Returns (True, None) on success
+    or (False, reason)."""
+    try:
+        ubot = (await user.get_me()).id
+        b = await get_assistant_member(c, chat_id, ubot)
+        if b.status == ChatMemberStatus.BANNED:
+            return False, f"@{ASSISTANT_NAME} is banned in this group — unban the assistant first."
+        return True, None
+    except (UserNotParticipant, PeerIdInvalid):
+        try:
+            if chat_username:
+                await user.join_chat(chat_username)
+            else:
+                invitelink = await c.export_chat_invite_link(chat_id)
+                if invitelink.startswith("https://t.me/+"):
+                    invitelink = invitelink.replace("https://t.me/+", "https://t.me/joinchat/")
+                await user.join_chat(invitelink)
+            return True, None
+        except UserAlreadyParticipant:
+            return True, None
+        except Exception as e:
+            return False, f"userbot failed to join: {e}"
+
+
+async def ensure_can_play(c, m) -> bool:
+    """Shared streaming gate: the bot must be an admin with Manage-video-chats /
+    Delete-messages / Add-users, the assistant must be in the group, and any
+    stale queue is cleared. Replies with the reason and returns False if not ready."""
+    chat_id = m.chat.id
+    if m.sender_chat:
+        await m.reply_text("you're an __Anonymous__ Admin !\n\n» revert back to a user account.")
+        return False
+    try:
+        a = await c.get_chat_member(chat_id, (await c.get_me()).id)
+    except Exception as e:
+        await m.reply_text(f"error:\n\n{e}")
+        return False
+    if a.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        await m.reply_text("💡 Make me an **Administrator** with **Manage video chats**, **Delete messages** and **Add users**.")
+        return False
+    p = a.privileges
+    if not (p and p.can_manage_video_chats and p.can_delete_messages and p.can_invite_users):
+        await m.reply_text("missing a required permission: **Manage video chats / Delete messages / Add users**")
+        return False
+    ok, reason = await ensure_assistant_in_chat(c, chat_id, m.chat.username)
+    if not ok:
+        await m.reply_text(f"❌ {reason}")
+        return False
+    await drop_stale_queue(chat_id)
+    return True
+
+
+keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(text="• Mᴇɴᴜ", callback_data="cbmenu"),
+                InlineKeyboardButton(text="• Cʟᴏsᴇ", callback_data="cls"),
+            ]
+        ]
+    )
+
+
+# Now-playing transport panel (tg-mpv-bot style) — reuses the existing callbacks.
+control_panel = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("⏸", callback_data="cbpause"),
+            InlineKeyboardButton("▶️", callback_data="cbresume"),
+            InlineKeyboardButton("⏭", callback_data="cbskip"),
+            InlineKeyboardButton("⏹", callback_data="cbstop"),
+        ],
+        [
+            InlineKeyboardButton("0%", callback_data="seekp:0"),
+            InlineKeyboardButton("25%", callback_data="seekp:25"),
+            InlineKeyboardButton("50%", callback_data="seekp:50"),
+            InlineKeyboardButton("75%", callback_data="seekp:75"),
+        ],
+        [
+            InlineKeyboardButton("🔉", callback_data="cbvoldown"),
+            InlineKeyboardButton("🔊", callback_data="cbvolup"),
+            InlineKeyboardButton("🔇", callback_data="cbmute"),
+            InlineKeyboardButton("🔈", callback_data="cbunmute"),
+        ],
+        [
+            InlineKeyboardButton("📸", callback_data="snap"),
+            InlineKeyboardButton("⏺ Rec / Stop", callback_data="rectoggle"),
+            InlineKeyboardButton("🗑 Close", callback_data="cls"),
+        ],
+    ]
+)
+
+
+def make_progress(message, label="📥 Downloading"):
+    """Return an async Pyrogram download-progress callback that edits `message`
+    with a percentage bar, throttled to at most once / 3s to avoid FloodWait."""
+    state = {"t": 0.0, "pct": -1}
+
+    async def progress(current, total):
+        pct = int(current * 100 / total) if total else 0
+        now = time()
+        if pct != 100 and (now - state["t"] < 3 or pct == state["pct"]):
+            return
+        state["t"] = now
+        state["pct"] = pct
+        filled = pct // 10
+        bar = "█" * filled + "░" * (10 - filled)
+        try:
+            await message.edit(
+                f"**{label}…**\n`{bar}` **{pct}%**  "
+                f"({current // 1048576}/{total // 1048576} MB)"
+            )
+        except Exception:
+            pass
+
+    return progress
+
+
+def _queued_paths():
+    """Local file paths referenced by any chat's active queue (never prune these)."""
+    used = set()
+    for chat_queue in QUEUE.values():
+        for item in chat_queue:
+            used.add(item[1])
+    return used
+
+
+def prune_downloads():
+    """Keep downloads/ under DOWNLOADS_CACHE_LIMIT_MB by deleting the oldest
+    cached files first. Files still referenced by a queue are never touched.
+    A limit of 0 clears everything that isn't queued."""
+    limit = DOWNLOADS_CACHE_LIMIT_MB * 1024 * 1024
+    folder = os.path.join(os.getcwd(), "downloads")
+    if not os.path.isdir(folder):
+        return
+    used = _queued_paths()
+    files = []
+    for name in os.listdir(folder):
+        # never prune session files or the persisted resume state
+        if name.endswith((".session", ".session-journal")) or name == "resume.json":
+            continue
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and path not in used:
+            try:
+                files.append((os.path.getmtime(path), path, os.path.getsize(path)))
+            except OSError:
+                pass
+    total = sum(size for _, _, size in files)
+    for _, path, size in sorted(files):  # oldest first
+        if total <= limit:
+            break
+        try:
+            os.remove(path)
+            total -= size
+        except OSError:
+            pass
+
+
+async def skip_current_song(chat_id):
+    if chat_id in QUEUE:
+        chat_queue = get_queue(chat_id)
+        if len(chat_queue) == 1:
+            await call_py.leave_call(chat_id)
+            clear_queue(chat_id)
+            return 1
+        else:
+            try:
+                songname = chat_queue[1][0]
+                url = chat_queue[1][1]
+                link = chat_queue[1][2]
+                type = chat_queue[1][3]
+                Q = chat_queue[1][4]
+                if type == "Audio":
+                    await call_py.play(chat_id, media_audio(url))
+                elif type == "Video":
+                    await call_py.play(chat_id, media_video(url, Q))
+                pop_an_item(chat_id)
+                return [songname, link, type]
+            except Exception:
+                log.warning("failed to advance queue in %s — leaving call", chat_id)
+                await call_py.leave_call(chat_id)
+                clear_queue(chat_id)
+                return 2
+    else:
+        return 0
+
+
+async def skip_item(chat_id, h):
+    if chat_id in QUEUE:
+        chat_queue = get_queue(chat_id)
+        try:
+            x = int(h)
+            songname = chat_queue[x][0]
+            chat_queue.pop(x)
+            return songname
+        except Exception as e:
+            log.warning("skip_item failed: %s", e)
+            return 0
+    else:
+        return 0
+
+
+# py-tgcalls 2.x: lifecycle is delivered through on_update + filters instead of
+# the old per-event decorators (on_kicked / on_closed_voice_chat / on_left).
+@call_py.on_update(
+    call_filters.chat_update(
+        ChatUpdate.Status.KICKED
+        | ChatUpdate.Status.LEFT_GROUP
+        | ChatUpdate.Status.CLOSED_VOICE_CHAT
+    )
+)
+async def chat_update_handler(_, update):
+    chat_id = update.chat_id
+    log.info("chat update in %s: %s — clearing queue", chat_id, update.status)
+    if chat_id in QUEUE:
+        clear_queue(chat_id)
+    prune_downloads()
+
+
+# ── Auto-DJ ──────────────────────────────────────────────────────────
+_RECENT = {}  # chat_id -> recently autoplayed video ids (avoid repeats)
+
+
+def _yt_id(url):
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/)([0-9A-Za-z_-]{11})", str(url))
+    return m.group(1) if m else None
+
+
+async def _related_ids(vid):
+    """YouTube Mix (autoplay radio) candidates for a video: [(id, title), …]."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp", "--no-warnings", "--flat-playlist", "--playlist-items", "2-15",
+            "--extractor-args", "youtube:player_client=android_vr",
+            "--print", "%(id)s\t%(title)s",
+            f"https://www.youtube.com/watch?v={vid}&list=RD{vid}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), 30)
+    except Exception:
+        return []
+    res = []
+    for line in out.decode(errors="ignore").splitlines():
+        if "\t" in line:
+            i, t = line.split("\t", 1)
+            if len(i) == 11:
+                res.append((i, t))
+    return res
+
+
+async def _autoplay_next(chat_id):
+    """If the current track is a YouTube source, fetch a related track (the YouTube
+    Mix) and append it to the queue as audio. Returns True if one was queued."""
+    q = get_queue(chat_id)
+    if not q:
+        return False
+    vid = _yt_id(q[0][2])
+    if not vid:
+        return False  # not a YouTube source — can't find a related track
+    recent = _RECENT.setdefault(chat_id, [])
+    cands = [(i, t) for i, t in await _related_ids(vid) if i != vid and i not in recent]
+    from program.music import ytdl as audio_dl  # lazy import: avoid a cycle
+    for cid, title in cands:
+        link = f"https://www.youtube.com/watch?v={cid}"
+        try:
+            ok, path = await audio_dl("bestaudio", link)
+        except Exception:
+            ok = 0
+        if ok == 0:
+            continue
+        add_to_queue(chat_id, title[:70], path, link, "Audio", 0)
+        recent.append(cid)
+        del recent[:-30]
+        await bot.send_message(chat_id, f"🎶 **Auto-DJ ▸ up next:** {title[:60]}",
+                                message_thread_id=get_active_thread(chat_id))
+        return True
+    return False
+
+
+_PREFETCH = {}  # chat_id -> src we've already kicked off an autoplay prefetch for
+
+
+async def maybe_prefetch_autoplay(chat_id):
+    """Called while a track plays: if autoplay is on and this is the *last*
+    queued track (a YouTube source), download the next related track in the
+    background now, so the hand-off is gapless instead of fetching at stream end."""
+    if not is_autoplay(chat_id):
+        return
+    q = get_queue(chat_id)
+    if not q or len(q) != 1:
+        return  # only when the current track is the last one
+    src = q[0][1]
+    if _PREFETCH.get(chat_id) == src or not _yt_id(q[0][2]):
+        return  # already prefetched for this track, or not a YouTube source
+    _PREFETCH[chat_id] = src   # mark now so we don't re-trigger while downloading
+    asyncio.ensure_future(_autoplay_next(chat_id))
+
+
+# NB: filters are classes — register an INSTANCE (stream_end()), not the class.
+# Scope to the audio track so a video ending doesn't fire the skip twice.
+@call_py.on_update(call_filters.stream_end(StreamEnded.Type.AUDIO))
+async def stream_end_handler(_, update):
+    chat_id = update.chat_id
+    # captured before skip_current_song()/clear_queue() below, which drop the
+    # chat's ACTIVE_THREAD entry once the session actually ends
+    thread_id = get_active_thread(chat_id)
+    # loop mode: replay the current track instead of advancing
+    if is_loop(chat_id):
+        q = get_queue(chat_id)
+        if q:
+            head = q[0]
+            try:
+                stream = media_video(head[1], head[4]) if head[3] == "Video" else media_audio(head[1])
+                await call_py.play(chat_id, stream)
+                log.info("stream ended in %s — looping current track", chat_id)
+                return
+            except Exception:
+                pass
+    # Auto-DJ: before the queue runs dry, line up a related track so playback
+    # keeps going. Additive + fail-safe — if it can't, we just advance as usual.
+    q = get_queue(chat_id)
+    if is_autoplay(chat_id) and q and len(q) == 1:
+        try:
+            await _autoplay_next(chat_id)
+        except Exception:
+            log.warning("autoplay failed in %s", chat_id)
+    log.info("stream ended in %s — advancing queue", chat_id)
+    op = await skip_current_song(chat_id)
+    if op == 1:
+        await bot.send_message(chat_id, "✅ streaming end", message_thread_id=thread_id)
+    elif op == 2:
+        await bot.send_message(chat_id, "❌ an error occurred\n\n» **Clearing** __Queues__ and leaving video chat.",
+                                message_thread_id=thread_id)
+    else:
+        await bot.send_message(chat_id, f"💡 **Streaming next track**\n\n🏷 **Name:** [{op[0]}]({op[1]}) | `{op[2]}`\n💭 **Chat:** `{chat_id}`", link_preview_options=LinkPreviewOptions(is_disabled=True), reply_markup=keyboard, message_thread_id=thread_id)
+    prune_downloads()
+
+
+async def bash(cmd):
+    process = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    err = stderr.decode().strip()
+    out = stdout.decode().strip()
+    return out, err

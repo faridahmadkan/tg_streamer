@@ -1,0 +1,676 @@
+import os
+import re
+import json
+import asyncio
+import subprocess
+from time import time
+
+import logging
+
+from config import (
+    ASSISTANT_NAME, BOT_USERNAME, BROWSER_FALLBACK_TIMEOUT, COOKIES_FILE, ENABLE_BROWSER_FALLBACK,
+    ENABLE_PLUGINS, IMG_1, IMG_2, MAX_QUEUE_SIZE, PLUGIN_DIR, PROXY_URL, SPONSORBLOCK_REMOVE,
+)
+from driver.design.thumbnail import thumb
+from driver.design.chatname import CHAT_TITLE
+from driver.browser import resolve_media_url
+from driver.decorators import errors
+from driver.filters import command, other_filters
+from driver.plugins import load_plugins, resolve_with_plugins
+from driver.queues import QUEUE, add_to_queue, drop_if_live, set_active_thread
+from driver.clients import call_py, user
+from driver.transcode import prepare_for_stream
+from driver.utils import (
+    get_assistant_member, make_progress, control_panel, media_video, drop_stale_queue,
+    remember_stream_headers,
+)
+from pyrogram import Client
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.errors import UserAlreadyParticipant, UserNotParticipant, PeerIdInvalid
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from youtubesearchpython import VideosSearch
+
+
+log = logging.getLogger(__name__)
+
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
+def _ytdl_site_flags():
+    """Build extra yt-dlp flags for non-YouTube sites (cookies, user-agent, proxy)."""
+    flags = ["--socket-timeout", "60"]
+    if COOKIES_FILE:
+        flags += ["--cookies", COOKIES_FILE]
+    flags += ["--user-agent", _DEFAULT_USER_AGENT]
+    if PROXY_URL:
+        flags += ["--proxy", PROXY_URL]
+    return flags
+
+
+def ytsearch(query: str):
+    try:
+        q = query.strip()
+        is_yt = bool(re.match(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/", q))
+        if re.match(r"https?://", q):
+            # any direct URL — use yt-dlp for metadata (handles YouTube, Rutube, Vimeo, …)
+            cmd = ["yt-dlp", "--no-warnings", "--skip-download",
+                   "--print", "%(title)s\x1f%(duration_string)s\x1f%(id)s\x1f%(thumbnail)s"]
+            if not is_yt:
+                cmd += _ytdl_site_flags()
+            cmd.append(q)
+            out = subprocess.run(
+                cmd,
+                capture_output=True, text=True, timeout=90,
+            ).stdout.strip().split("\x1f")
+            title = out[0] if out and out[0] else q
+            duration = out[1] if len(out) > 1 else ""
+            vid = out[2] if len(out) > 2 and out[2] else ""
+            raw_thumb = out[3] if len(out) > 3 else ""
+            thumbnail = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if is_yt and vid else raw_thumb
+            return [title, q, duration, thumbnail]
+        search = VideosSearch(query, limit=1).result()
+        data = search["result"][0]
+        songname = data["title"]
+        url = data["link"]
+        duration = data["duration"]
+        thumbnail = f"https://i.ytimg.com/vi/{data['id']}/hqdefault.jpg"
+        return [songname, url, duration, thumbnail]
+    except Exception as e:
+        log.warning("ytsearch failed: %s", e)
+        return 0
+
+
+_YT_RE = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/")
+
+
+async def _extract_site(link):
+    """yt-dlp extraction for a non-YouTube page → ``(1, stream_url)`` or
+    ``(0, error)``. Streams the master manifest directly via ffmpeg."""
+    proc = await asyncio.create_subprocess_exec(
+        "yt-dlp", "--no-warnings", "--no-playlist",
+        *_ytdl_site_flags(),
+        "--dump-json",
+        "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        link,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        err = stderr.decode(errors="ignore")[-400:]
+        return 0, (err or "metadata extraction failed")
+    try:
+        info = json.loads(stdout.decode(errors="ignore"))
+    except Exception:
+        return 0, "invalid yt-dlp JSON"
+    # preferred_formats[0].manifest_url is the master m3u8 URL
+    mf = info.get("requested_formats") or []
+    manifest = None
+    for f in mf:
+        manifest = f.get("manifest_url") or manifest
+    if not manifest:
+        # fallback: individual format url (muxed stream, e.g. Rutube)
+        for f in mf:
+            u = f.get("url")
+            if u:
+                return 1, u
+        # sites with no requested_formats at all (single already-muxed
+        # stream, e.g. Rutube) put the playable URL at the top level
+        u = info.get("url")
+        if u:
+            return 1, u
+        return 0, "no stream URL found"
+    return 1, manifest
+
+
+async def _set_status(status_msg, text):
+    if status_msg is None:
+        return
+    try:
+        await status_msg.edit_text(text)
+    except Exception:
+        pass  # message gone / unchanged — never block playback on cosmetics
+
+
+async def _resolve_site(link, status_msg=None):
+    """Non-YouTube link → ``(1, stream_url)`` or ``(0, error)``.
+
+    Order: extractor plugins (PLUGIN_DIR) → yt-dlp → headless-Chromium
+    fallback (ENABLE_BROWSER_FALLBACK, needs INSTALL_BROWSER=true in the
+    image). The referer/headers a resolver needs are remembered for the
+    stream so ffmpeg sends them (see driver.utils.remember_stream_headers).
+    """
+    if ENABLE_PLUGINS and PLUGIN_DIR:
+        found = await resolve_with_plugins(link, load_plugins(PLUGIN_DIR))
+        if found:
+            headers = dict(found.headers or {})
+            if found.referer:
+                headers.setdefault("Referer", found.referer)
+            remember_stream_headers(found.media_url, headers)
+            return 1, found.media_url
+
+    ok, result = await _extract_site(link)
+    if ok or not ENABLE_BROWSER_FALLBACK:
+        return ok, result
+
+    log.info("yt-dlp could not extract %s — trying headless browser", link)
+    await _set_status(status_msg, "🌐 No extractor matched — sniffing the page in a headless browser…")
+    sniffed = await resolve_media_url(link, BROWSER_FALLBACK_TIMEOUT)
+    if not sniffed:
+        return 0, result  # keep yt-dlp's original error
+    media_url, referer = sniffed
+    remember_stream_headers(media_url, {"Referer": referer} if referer else {})
+    return 1, media_url
+
+
+async def ytdl(link, status_msg=None):
+    # Non-YouTube sites: extract the master m3u8 manifest URL and stream it
+    # directly via ffmpeg (no download needed).  The master manifest contains
+    # both video and audio variant playlists — ffmpeg selects the best match.
+    # YouTube URLs 403 ffmpeg directly, so they must be downloaded first.
+    if not _YT_RE.match(link):
+        return await _resolve_site(link, status_msg)
+
+    proc = await asyncio.create_subprocess_exec(
+        "yt-dlp",
+        "--no-warnings",
+        "--no-playlist",
+        *(["--sponsorblock-remove", SPONSORBLOCK_REMOVE] if SPONSORBLOCK_REMOVE else []),
+        "--no-simulate",
+        "--newline",
+        "--progress-template",
+        "download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
+        # android_vr client avoids YouTube's SABR-gating (the default clients
+        # only offer the progressive itag-18 stream, which 403s).
+        *(["--extractor-args", "youtube:player_client=android"]
+          if _YT_RE.match(link) else []),
+        # Prefer H.264 video + AAC(m4a) audio so the merge produces a universally
+        # playable, light-to-stream mp4 (avoids AV1/VP9/Opus -> mp4 issues).
+        "-f",
+        "bestvideo[height<=?720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=?720][ext=mp4]+bestaudio[ext=m4a]/best[height<=?720]/best",
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        "downloads/%(id)s.%(ext)s",
+        f"{link}",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stderr_buf = []
+
+    async def _drain_stderr():
+        while True:
+            chunk = await proc.stderr.readline()
+            if not chunk:
+                break
+            stderr_buf.append(chunk.decode(errors="ignore"))
+
+    stderr_task = asyncio.ensure_future(_drain_stderr())
+
+    path = ""
+    last_edit = 0.0
+    while True:
+        raw = await proc.stdout.readline()
+        if not raw:
+            break
+        line = raw.decode(errors="ignore").strip()
+        if not line:
+            continue
+        if line.startswith("PROG|"):
+            if status_msg is not None and time() - last_edit >= 3:
+                last_edit = time()
+                parts = line.split("|")
+                pct = parts[1].strip() if len(parts) > 1 else ""
+                spd = parts[2].strip() if len(parts) > 2 else ""
+                eta = parts[3].strip() if len(parts) > 3 else ""
+                try:
+                    await status_msg.edit(
+                        f"📥 **Downloading from YouTube…** `{pct}`\n({spd}, ETA {eta})"
+                    )
+                except Exception:
+                    pass
+        elif "[download]" in line and "Destination:" in line:
+            path = line.split("Destination:", 1)[1].strip()
+        elif "[download]" in line and "has already been downloaded" in line:
+            path = line.split("[download]", 1)[1].split("has already")[0].strip()
+        elif "[Merger] Merging formats into" in line:
+            path = line.split("into", 1)[1].strip().strip('"')
+    await proc.wait()
+    await stderr_task
+    if proc.returncode == 0 and path:
+        return 1, path
+    return 0, ("".join(stderr_buf)[-500:] or "download failed")
+
+
+@Client.on_message(command(["vplay", f"vplay@{BOT_USERNAME}"]) & other_filters)
+@errors
+async def vplay(c: Client, m: Message):
+    # snapshot before any await: pyrogram's message-cache can mutate .command
+    # back to None on a cached Message once another handler's filter check
+    # runs against it concurrently, which happens easily once we start
+    # awaiting below (a bare `m.command` read later crashed with
+    # "TypeError: object of type 'NoneType' has no len()")
+    cmd_args = m.command
+    await m.delete()
+    replied = m.reply_to_message
+    chat_id = m.chat.id
+    thread_id = m.message_thread_id if getattr(m, "topic_message", False) else None
+    keyboard = control_panel
+    # "/vplay ... mute" starts the stream with the assistant muted
+    args = [a.lower() for a in cmd_args[1:]]
+    start_muted = "mute" in args
+    if m.sender_chat:
+        return await m.reply_text("you're an __Anonymous__ Admin !\n\n» revert back to user account from admin rights.")
+    try:
+        aing = await c.get_me()
+    except Exception as e:
+        return await m.reply_text(f"error:\n\n{e}")
+    a = await c.get_chat_member(chat_id, aing.id)
+    if a.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        await m.reply_text(
+            f"💡 To use me, I need to be an **Administrator** with the following **permissions**:\n\n» ❌ __Delete messages__\n» ❌ __Add users__\n» ❌ __Manage video chat__\n\nData is **updated** automatically after you **promote me**"
+        )
+        return
+    priv = a.privileges
+    if not (priv and priv.can_manage_video_chats):
+        await m.reply_text(
+            "missing required permission:" + "\n\n» ❌ __Manage video chat__"
+        )
+        return
+    if not (priv and priv.can_delete_messages):
+        await m.reply_text(
+            "missing required permission:" + "\n\n» ❌ __Delete messages__"
+        )
+        return
+    if not (priv and priv.can_invite_users):
+        await m.reply_text("missing required permission:" + "\n\n» ❌ __Add users__")
+        return
+    try:
+        ubot = (await user.get_me()).id
+        b = await get_assistant_member(c, chat_id, ubot)
+        if b.status == ChatMemberStatus.BANNED:
+            await m.reply_text(
+                f"@{ASSISTANT_NAME} **is banned in group** {m.chat.title}\n\n» **unban the userbot first if you want to use this bot.**"
+            )
+            return
+    except (UserNotParticipant, PeerIdInvalid):
+        if m.chat.username:
+            try:
+                await user.join_chat(m.chat.username)
+            except UserAlreadyParticipant:
+                pass
+            except Exception as e:
+                await m.reply_text(f"❌ **userbot failed to join**\n\n**reason**: `{e}`")
+                return
+        else:
+            try:
+                invitelink = await c.export_chat_invite_link(
+                    m.chat.id
+                )
+                if invitelink.startswith("https://t.me/+"):
+                    invitelink = invitelink.replace(
+                        "https://t.me/+", "https://t.me/joinchat/"
+                    )
+                await user.join_chat(invitelink)
+            except UserAlreadyParticipant:
+                pass
+            except Exception as e:
+                return await m.reply_text(
+                    f"❌ **userbot failed to join**\n\n**reason**: `{e}`"
+                )
+
+    # if a previous stream died silently, clear the stale queue so we rejoin
+    await drop_stale_queue(chat_id)
+    # radio/IPTV never hold a real queue slot — a new /vplay takes over now
+    drop_if_live(chat_id)
+    # set after the drop_*() calls above, which may clear_queue() (and with it
+    # any stale ACTIVE_THREAD entry) before this session's is recorded
+    set_active_thread(chat_id, thread_id)
+    if replied:
+        if replied.video or replied.document:
+            media = replied.video or replied.document
+            ext = os.path.splitext(media.file_name or "")[1] or ".mp4"
+            cached = os.path.join(os.getcwd(), "downloads", f"{media.file_unique_id}{ext}")
+            if os.path.exists(cached) and os.path.getsize(cached) == media.file_size:
+                # same Telegram file already fully downloaded — reuse it
+                os.utime(cached, None)  # mark fresh for the LRU cache pruner
+                loser = await replied.reply("📦 **already downloaded — starting...**")
+                dl = cached
+            else:
+                if media.file_size and media.file_size > 2 * 1024 ** 3:
+                    await replied.reply(
+                        f"⚠️ This file is **{media.file_size / 1024 ** 3:.1f} GB**. Telegram caps "
+                        "downloads at **2 GB** for standard accounts (4 GB for Premium), so it "
+                        "may fail to download. Trying anyway…"
+                    )
+                loser = await replied.reply("📥 **downloading video...**")
+                dl = await replied.download(
+                    file_name=cached,
+                    progress=make_progress(loser, "📥 Downloading video"),
+                )
+            link = replied.link
+            # args may contain a quality (720/480/360) and/or "mute"
+            qargs = [a for a in args if a in ("720", "480", "360")]
+            Q = int(qargs[0]) if qargs else 720
+            # Title preference: message caption (manual uploads put the title
+            # there and often have no file_name) > file name > generic.
+            if replied.caption:
+                songname = str(replied.caption).splitlines()[0][:70]
+            elif media.file_name:
+                songname = media.file_name[:70]
+            else:
+                songname = "Video"
+
+            if chat_id in QUEUE:
+                pos = add_to_queue(chat_id, songname, dl, link, "Video", Q)
+                if pos == -1:
+                    return await loser.edit(f"🚫 queue is full (max {MAX_QUEUE_SIZE}).")
+                await loser.delete()
+                requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
+                await m.reply_photo(
+                    photo=f"{IMG_1}",
+                    caption=f"💡 **Track added to queue »** `{pos}`\n\n🏷 **Name:** [{songname}]({link}) | `video`\n💭 **Chat:** `{chat_id}`\n🎧 **Request by:** {requester}",
+                    reply_markup=keyboard,
+                )
+            else:
+                try:
+                  dl = await prepare_for_stream(dl, loser)
+                  await loser.edit("🔄 **Joining vc...**")
+                  await call_py.play(chat_id, media_video(dl, Q))
+                  if start_muted:
+                      try:
+                          await call_py.mute(chat_id)
+                      except Exception:
+                          pass
+                  add_to_queue(chat_id, songname, dl, link, "Video", Q)
+                  await loser.delete()
+                  requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
+                  await m.reply_photo(
+                    photo=f"{IMG_2}",
+                    caption=f"🏷 **Name:** [{songname}]({link})\n💭 **Chat:** `{chat_id}`\n💡 **Status:** `Playing`\n🎧 **Request by:** {requester}\n📹 **Stream type:** `Video`",
+                    reply_markup=keyboard,
+                  )
+                except Exception as ep:
+                  await loser.delete()
+                  await m.reply_text(f"🚫 error: `{ep}`")
+        else:
+            if len(cmd_args) < 2:
+                await m.reply(
+                    "» reply to an **video file** or **give something to search.**"
+                )
+            else:
+                loser = await c.send_message(chat_id, "🔍 **Searching...**", message_thread_id=thread_id)
+                query = m.text.split(None, 1)[1]
+                if start_muted and query.lower().endswith("mute"):
+                    query = query[:-4].strip()
+                search = ytsearch(query)
+                Q = 720
+                if search == 0:
+                    await loser.edit("❌ **no results found.**")
+                else:
+                    songname = search[0]
+                    title = search[0]
+                    url = search[1]
+                    duration = search[2]
+                    thumbnail = search[3]
+                    userid = m.from_user.id
+                    gcname = m.chat.title
+                    try:
+                        ctitle = await CHAT_TITLE(gcname)
+                        image = await thumb(thumbnail, title, userid, ctitle)
+                    except Exception as e:
+                        log.warning("thumb() failed: %s %s", type(e).__name__, e, exc_info=True)
+                        return await loser.edit(f"🚫 couldn't build the thumbnail: `{type(e).__name__}: {e}`")
+                    ok, ytlink = await ytdl(url, loser)
+                    if ok == 0:
+                        await loser.edit(f"❌ yt-dl issues detected\n\n» `{ytlink}`")
+                    else:
+                        if chat_id in QUEUE:
+                            pos = add_to_queue(
+                                chat_id, songname, ytlink, url, "Video", Q
+                            )
+                            if pos == -1:
+                                return await loser.edit(f"🚫 queue is full (max {MAX_QUEUE_SIZE}).")
+                            await loser.delete()
+                            requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
+                            await m.reply_photo(
+                                photo=image,
+                                caption=f"💡 **Track added to queue »** `{pos}`\n\n🏷 **Name:** [{songname}]({url}) | `video`\n⏱ **Duration:** `{duration}`\n🎧 **Request by:** {requester}",
+                                reply_markup=keyboard,
+                            )
+                        else:
+                            try:
+                                await loser.edit("🔄 **Joining vc...**")
+                                await call_py.play(chat_id, media_video(ytlink, Q))
+                                if start_muted:
+                                    try:
+                                        await call_py.mute(chat_id)
+                                    except Exception:
+                                        pass
+                                add_to_queue(chat_id, songname, ytlink, url, "Video", Q)
+                                await loser.delete()
+                                requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
+                                await m.reply_photo(
+                                    photo=image,
+                                    caption=f"🏷 **Name:** [{songname}]({url})\n⏱ **Duration:** `{duration}`\n💡 **Status:** `Playing`\n🎧 **Request by:** {requester}\n📹 **Stream type:** `Video`",
+                                    reply_markup=keyboard,
+                                )
+                            except Exception as ep:
+                                await loser.delete()
+                                await m.reply_text(f"🚫 error: `{ep}`")
+
+    else:
+        if len(cmd_args) < 2:
+            await m.reply(
+                "» reply to an **video file** or **give something to search.**"
+            )
+        else:
+            loser = await c.send_message(chat_id, "🔍 **Searching...**", message_thread_id=thread_id)
+            query = m.text.split(None, 1)[1]
+            search = ytsearch(query)
+            Q = 720
+            if search == 0:
+                await loser.edit("❌ **no results found.**")
+            else:
+                songname = search[0]
+                title = search[0]
+                url = search[1]
+                duration = search[2]
+                thumbnail = search[3]
+                userid = m.from_user.id
+                gcname = m.chat.title
+                try:
+                    ctitle = await CHAT_TITLE(gcname)
+                    image = await thumb(thumbnail, title, userid, ctitle)
+                except Exception as e:
+                    log.warning("thumb() failed: %s %s", type(e).__name__, e, exc_info=True)
+                    return await loser.edit(f"🚫 couldn't build the thumbnail: `{type(e).__name__}: {e}`")
+                ok, ytlink = await ytdl(url, loser)
+                if ok == 0:
+                    await loser.edit(f"❌ yt-dl issues detected\n\n» `{ytlink}`")
+                else:
+                    if chat_id in QUEUE:
+                        pos = add_to_queue(chat_id, songname, ytlink, url, "Video", Q)
+                        if pos == -1:
+                            return await loser.edit(f"🚫 queue is full (max {MAX_QUEUE_SIZE}).")
+                        await loser.delete()
+                        requester = (
+                            f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
+                        )
+                        await m.reply_photo(
+                            photo=image,
+                            caption=f"💡 **Track added to queue »** `{pos}`\n\n🏷 **Name:** [{songname}]({url}) | `video`\n⏱ **Duration:** `{duration}`\n🎧 **Request by:** {requester}",
+                            reply_markup=keyboard,
+                        )
+                    else:
+                        try:
+                            await loser.edit("🔄 **Joining vc...**")
+                            await call_py.play(chat_id, media_video(ytlink, Q))
+                            if start_muted:
+                                try:
+                                    await call_py.mute(chat_id)
+                                except Exception:
+                                    pass
+                            add_to_queue(chat_id, songname, ytlink, url, "Video", Q)
+                            await loser.delete()
+                            requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
+                            await m.reply_photo(
+                                photo=image,
+                                caption=f"🏷 **Name:** [{songname}]({url})\n⏱ **Duration:** `{duration}`\n💡 **Status:** `Playing`\n🎧 **Request by:** {requester}\n📹 **Stream type:** `Video`",
+                                reply_markup=keyboard,
+                            )
+                        except Exception as ep:
+                            await loser.delete()
+                            await m.reply_text(f"🚫 error: `{ep}`")
+
+
+@Client.on_message(command(["vstream", f"vstream@{BOT_USERNAME}"]) & other_filters)
+@errors
+async def vstream(c: Client, m: Message):
+    # snapshot before any await: pyrogram's message-cache can mutate .command
+    # back to None on a cached Message once another handler's filter check
+    # runs against it concurrently, which happens easily once we start
+    # awaiting below (a bare `m.command` read later crashed with
+    # "TypeError: object of type 'NoneType' has no len()")
+    cmd_args = m.command
+    await m.delete()
+    chat_id = m.chat.id
+    thread_id = m.message_thread_id if getattr(m, "topic_message", False) else None
+    keyboard = control_panel
+    if m.sender_chat:
+        return await m.reply_text("you're an __Anonymous__ Admin !\n\n» revert back to user account from admin rights.")
+    try:
+        aing = await c.get_me()
+    except Exception as e:
+        return await m.reply_text(f"error:\n\n{e}")
+    a = await c.get_chat_member(chat_id, aing.id)
+    if a.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        await m.reply_text(
+            f"💡 To use me, I need to be an **Administrator** with the following **permissions**:\n\n» ❌ __Delete messages__\n» ❌ __Add users__\n» ❌ __Manage video chat__\n\nData is **updated** automatically after you **promote me**"
+        )
+        return
+    priv = a.privileges
+    if not (priv and priv.can_manage_video_chats):
+        await m.reply_text(
+            "missing required permission:" + "\n\n» ❌ __Manage video chat__"
+        )
+        return
+    if not (priv and priv.can_delete_messages):
+        await m.reply_text(
+            "missing required permission:" + "\n\n» ❌ __Delete messages__"
+        )
+        return
+    if not (priv and priv.can_invite_users):
+        await m.reply_text("missing required permission:" + "\n\n» ❌ __Add users__")
+        return
+    try:
+        ubot = (await user.get_me()).id
+        b = await get_assistant_member(c, chat_id, ubot)
+        if b.status == ChatMemberStatus.BANNED:
+            await m.reply_text(
+                f"@{ASSISTANT_NAME} **is banned in group** {m.chat.title}\n\n» **unban the userbot first if you want to use this bot.**"
+            )
+            return
+    except (UserNotParticipant, PeerIdInvalid):
+        if m.chat.username:
+            try:
+                await user.join_chat(m.chat.username)
+            except UserAlreadyParticipant:
+                pass
+            except Exception as e:
+                await m.reply_text(f"❌ **userbot failed to join**\n\n**reason**: `{e}`")
+                return
+        else:
+            try:
+                invitelink = await c.export_chat_invite_link(
+                    m.chat.id
+                )
+                if invitelink.startswith("https://t.me/+"):
+                    invitelink = invitelink.replace(
+                        "https://t.me/+", "https://t.me/joinchat/"
+                    )
+                await user.join_chat(invitelink)
+            except UserAlreadyParticipant:
+                pass
+            except Exception as e:
+                return await m.reply_text(
+                    f"❌ **userbot failed to join**\n\n**reason**: `{e}`"
+                )
+
+    # if a previous stream died silently, clear the stale queue so we rejoin
+    await drop_stale_queue(chat_id)
+    # radio/IPTV never hold a real queue slot — a new /vstream takes over now
+    drop_if_live(chat_id)
+    # set after the drop_*() calls above, which may clear_queue() (and with it
+    # any stale ACTIVE_THREAD entry) before this session's is recorded
+    set_active_thread(chat_id, thread_id)
+    if len(cmd_args) < 2:
+        await m.reply("» give me a live-link/m3u8 url/youtube link to stream.")
+    else:
+        if len(cmd_args) == 2:
+            link = m.text.split(None, 1)[1]
+            Q = 720
+            loser = await c.send_message(chat_id, "🔄 **processing stream...**", message_thread_id=thread_id)
+        elif len(cmd_args) == 3:
+            op = m.text.split(None, 1)[1]
+            link = op.split(None, 1)[0]
+            quality = op.split(None, 1)[1]
+            if quality == "720" or "480" or "360":
+                Q = int(quality)
+            else:
+                Q = 720
+                await m.reply(
+                    "» __only 720, 480, 360 allowed__ \n💡 **now streaming video in 720p**"
+                )
+            loser = await c.send_message(chat_id, "🔄 **processing stream...**", message_thread_id=thread_id)
+        else:
+            return await m.reply("**/vstream {link} {720/480/360}**")
+
+        if _YT_RE.match(link):
+            ok, livelink = await ytdl(link, loser)
+        else:
+            # Not YouTube — could be a page URL from a site yt-dlp supports
+            # (Rutube, Vimeo, ...) or an already-direct stream link (m3u8/IPTV).
+            # Try extraction first; if the extractor doesn't recognize the URL,
+            # fall back to using it as-is.
+            ok, extracted = await ytdl(link, loser)
+            if ok:
+                livelink = extracted
+            else:
+                livelink = link
+                ok = 1
+
+        if ok == 0:
+            await loser.edit(f"❌ yt-dl issues detected\n\n» `{livelink}`")
+        else:
+            if chat_id in QUEUE:
+                pos = add_to_queue(chat_id, "Live Stream", livelink, link, "Video", Q)
+                if pos == -1:
+                    return await loser.edit(f"🚫 queue is full (max {MAX_QUEUE_SIZE}).")
+                await loser.delete()
+                requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
+                await m.reply_photo(
+                    photo=f"{IMG_1}",
+                    caption=f"💡 **Track added to queue »** `{pos}`\n\n💭 **Chat:** `{chat_id}`\n🎧 **Request by:** {requester}",
+                    reply_markup=keyboard,
+                )
+            else:
+                try:
+                    await loser.edit("🔄 **Joining vc...**")
+                    await call_py.play(chat_id, media_video(livelink, Q))
+                    add_to_queue(chat_id, "Live Stream", livelink, link, "Video", Q)
+                    await loser.delete()
+                    requester = (
+                        f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
+                    )
+                    await m.reply_photo(
+                        photo=f"{IMG_2}",
+                        caption=f"💡 **[Video live]({link}) stream started.**\n\n💭 **Chat:** `{chat_id}`\n💡 **Status:** `Playing`\n🎧 **Request by:** {requester}",
+                        reply_markup=keyboard,
+                    )
+                except Exception as ep:
+                    await loser.delete()
+                    await m.reply_text(f"🚫 error: `{ep}`")
