@@ -65,7 +65,8 @@ def _progress_caption(title, url, duration, requester, position):
         timeline = f"`{_clock(position)}` {bar} `{_clock(total)}`"
     else:
         # Duration is not always supplied by a provider; still show elapsed time.
-        timeline = f"`{_clock(position)}` {"━" * (1 + (position // 10) % 10)}●"
+        bar = "━" * (1 + (position // 10) % 10) + "●"
+        timeline = f"`{_clock(position)}` {bar}"
     return (f"🏷 **Name:** [{title[:70]}]({url})\n"
             f"⏱ **Duration:** `{_clock(total) if total else (str(duration) or 'Unknown')}`\n"
             f"{timeline}\n"
