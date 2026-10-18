@@ -113,3 +113,14 @@ cloud-hosting IPs independently of the bot code.
 ## Music provider selection
 
 Bot admins can use `/provider` in Telegram to choose **Auto**, **YouTube**, **YouTube Music**, **SoundCloud**, or **Google Videos**. The selected catalog is prioritized; if it fails, the bot searches the remaining catalogs as fallbacks. The preference is saved to `data/music_provider.json` on the host filesystem. On ephemeral hosting, persist the `data/` directory with a volume if you want this setting to survive restarts. Provider availability depends on yt-dlp support, network access, and each service's restrictions; no provider can guarantee every track.
+
+### Music provider selection
+
+Configured bot administrators (`SUDO_USERS` in the environment) can send `/provider` in Telegram to choose a preferred source:
+- **Auto (fallback)**: tries the supported search sources.
+- **YouTube** / **YouTube Music**: prioritizes YouTube search results.
+- **SoundCloud**: prioritizes SoundCloud search results.
+- **Google Videos**: prioritizes yt-dlp's Google Videos search.
+
+A selected provider is a preference, not a hard lock: if it fails, the bot tries other available sources. The setting is stored in `data/music_provider.json`; use persistent storage for the `data/` directory if your hosting filesystem is ephemeral. YouTube Music and YouTube share underlying YouTube delivery, so they are separate preferences rather than independent audio hosts.
+

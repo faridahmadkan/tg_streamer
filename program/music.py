@@ -4,11 +4,13 @@ import os
 import re
 import asyncio
 import subprocess
+import json
+from pathlib import Path
 from time import time
 
 import logging
 
-from config import ASSISTANT_NAME, BOT_USERNAME, COOKIES_FILE, IMG_1, IMG_2, MAX_QUEUE_SIZE, PROXY_URL, SPONSORBLOCK_REMOVE
+from config import ASSISTANT_NAME, BOT_USERNAME, COOKIES_FILE, IMG_1, IMG_2, MAX_QUEUE_SIZE, PROXY_URL, SPONSORBLOCK_REMOVE, SUDO_USERS
 from driver.design.thumbnail import thumb
 from driver.design.chatname import CHAT_TITLE
 from driver.decorators import errors
@@ -16,7 +18,7 @@ from driver.filters import command, other_filters
 from driver.queues import QUEUE, add_to_queue, drop_if_live, set_active_thread
 from driver.clients import call_py, user
 from driver.utils import get_assistant_member, bash, make_progress, control_panel, media_audio, drop_stale_queue
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import UserAlreadyParticipant, UserNotParticipant, PeerIdInvalid
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -24,6 +26,33 @@ from youtubesearchpython import VideosSearch
 
 
 log = logging.getLogger(__name__)
+
+_PROVIDER_FILE = Path("data/music_provider.json")
+_PROVIDER_OPTIONS = {
+    "auto": "Auto (fallback)",
+    "youtube": "YouTube",
+    "youtube_music": "YouTube Music",
+    "soundcloud": "SoundCloud",
+    "google_videos": "Google Videos",
+}
+
+def _get_provider():
+    try:
+        value = json.loads(_PROVIDER_FILE.read_text(encoding="utf-8")).get("provider", "auto")
+        return value if value in _PROVIDER_OPTIONS else "auto"
+    except Exception:
+        return "auto"
+
+def _set_provider(value):
+    if value not in _PROVIDER_OPTIONS:
+        return False
+    try:
+        _PROVIDER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _PROVIDER_FILE.write_text(json.dumps({"provider": value}), encoding="utf-8")
+        return True
+    except OSError as exc:
+        log.warning("Could not persist music provider: %s", exc)
+        return False
 
 _DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -87,64 +116,71 @@ def ytsearch(query: str):
 
 
 def ytsearch_all(query: str, limit: int = 5):
-    """Return deduplicated music candidates from YouTube and SoundCloud.
-
-    Search is metadata-only; playback still uses yt-dlp/ffmpeg. If one provider
-    blocks a track, the caller can try the next candidate rather than giving up.
-    """
+    """Search multiple catalogs in selected-provider-first order, then fall back."""
     q = (query or "").strip()
     if not q:
         return []
-    candidates = []
-    seen = set()
+    candidates, seen = [], set()
 
     def add(title, url, duration="", thumbnail="", provider=""):
-        if not url or url in seen:
+        if not url:
+            return
+        url = str(url).strip()
+        if not url.startswith(("https://", "http://")) or url in seen:
             return
         seen.add(url)
         candidates.append([title or q, url, duration or "", thumbnail or "", provider])
 
-    # Preserve direct URL behavior. For a pasted URL, try it as the sole candidate.
     if re.match(r"https?://", q, re.I):
         first = ytsearch(q)
         if first:
-            add(*first, provider="direct URL")
+            add(*first, provider="Direct URL")
         return candidates
 
-    # Provider 1: YouTube's search API wrapper (fast, metadata only).
-    try:
-        result = VideosSearch(q, limit=limit).result().get("result", [])
-        for item in result:
-            vid = item.get("id", "")
-            add(item.get("title"), item.get("link"), item.get("duration"),
-                f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if vid else "", "YouTube")
-    except Exception as exc:
-        log.warning("YouTube search provider failed: %s", exc)
+    selected = _get_provider()
+    if selected in ("auto", "youtube", "youtube_music"):
+        try:
+            result = VideosSearch(q, limit=limit).result().get("result", [])
+            for item in result:
+                vid = item.get("id", "")
+                add(item.get("title"), item.get("link"), item.get("duration"),
+                    f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if vid else "",
+                    "YouTube Music" if selected == "youtube_music" else "YouTube")
+        except Exception as exc:
+            log.warning("YouTube search provider failed: %s", exc)
 
-    # Provider 2: yt-dlp's own search extractors. SoundCloud is a separate
-    # catalog and often succeeds when YouTube search or media delivery fails.
-    for prefix, provider in (("scsearch", "SoundCloud"), ("ytsearch", "YouTube (yt-dlp)")):
+    search_sources = [
+        ("scsearch", "SoundCloud", "soundcloud"),
+        ("ytsearch", "YouTube (yt-dlp)", "youtube"),
+        ("gvsearch", "Google Videos", "google_videos"),
+    ]
+    if selected != "auto":
+        search_sources.sort(key=lambda item: 0 if item[2] == selected else 1)
+    for prefix, provider, key in search_sources:
+        if key == "youtube" and selected in ("auto", "youtube", "youtube_music"):
+            continue
         try:
             proc = subprocess.run(
                 ["yt-dlp", "--no-warnings", "--skip-download", "--flat-playlist",
                  "--dump-single-json", *_ytdl_site_flags(), f"{prefix}{limit}:{q}"],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=22,
             )
             if proc.returncode != 0 or not proc.stdout.strip():
-                log.warning("%s search failed: %s", provider, proc.stderr[-250:])
+                log.warning("%s search failed: %s", provider, (proc.stderr or "")[-250:])
                 continue
-            import json
             data = json.loads(proc.stdout)
             entries = data.get("entries") or [data]
             for item in entries:
                 url = item.get("webpage_url") or item.get("url")
-                if url and not str(url).startswith("http"):
+                if url and not str(url).startswith(("http://", "https://")):
                     if "youtube" in provider.lower() and item.get("id"):
                         url = "https://www.youtube.com/watch?v=" + item["id"]
                     else:
                         continue
-                add(item.get("title"), url, item.get("duration_string") or "",
+                add(item.get("title"), url, item.get("duration_string") or item.get("duration") or "",
                     item.get("thumbnail") or "", provider)
+        except subprocess.TimeoutExpired:
+            log.warning("%s search timed out; moving to next provider", provider)
         except Exception as exc:
             log.warning("%s search provider error: %s", provider, exc)
     return candidates
@@ -256,7 +292,8 @@ async def ytdl(format: str, link: str, status_msg=None):
 
 async def find_and_download_music(query: str, status_msg=None):
     """Search multiple catalogs and try candidates until one streams/downloads."""
-    candidates = ytsearch_all(query, limit=5)
+    # Search providers in a worker thread so a slow external search cannot block Telegram updates.
+    candidates = await asyncio.to_thread(ytsearch_all, query, 5)
     if not candidates:
         return None, "No results found across YouTube and SoundCloud."
     errors = []
@@ -279,6 +316,46 @@ async def find_and_download_music(query: str, status_msg=None):
         except Exception as exc:
             errors.append(f"{provider or 'provider'}: {str(exc)[-180:]}")
     return None, "All providers failed. " + " | ".join(errors[-3:])
+
+
+@Client.on_message(command(["provider", f"provider@{BOT_USERNAME}"]))
+@errors
+async def provider_command(c: Client, m: Message):
+    if not m.from_user or m.from_user.id not in SUDO_USERS:
+        return await m.reply_text("⛔ Only configured bot admins can change the music provider.")
+    current = _get_provider()
+    rows = [[InlineKeyboardButton(("✅ " if key == current else "") + label,
+                                  callback_data=f"musicprovider:{key}")]
+            for key, label in _PROVIDER_OPTIONS.items()]
+    await m.reply_text(
+        f"🎵 **Music provider settings**\\n\\nCurrent: **{_PROVIDER_OPTIONS[current]}**\\n"
+        "Choose a preferred source. If it fails, the bot will try other sources.",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^musicprovider:"))
+@errors
+async def provider_callback(c, query):
+    if not query.from_user or query.from_user.id not in SUDO_USERS:
+        return await query.answer("Only configured bot admins can change the provider.", show_alert=True)
+    value = query.data.split(":", 1)[1]
+    if value not in _PROVIDER_OPTIONS:
+        return await query.answer("Unknown provider.", show_alert=True)
+    if not _set_provider(value):
+        return await query.answer("Could not save provider; check filesystem permissions.", show_alert=True)
+    rows = [[InlineKeyboardButton(("✅ " if key == value else "") + label,
+                                  callback_data=f"musicprovider:{key}")]
+            for key, label in _PROVIDER_OPTIONS.items()]
+    try:
+        await query.edit_message_text(
+            f"🎵 **Music provider settings**\\n\\nCurrent: **{_PROVIDER_OPTIONS[value]}**\\n"
+            "Other supported sources remain available as fallback.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except Exception:
+        pass
+    await query.answer(f"Provider set to {_PROVIDER_OPTIONS[value]}")
 
 
 @Client.on_message(command(["play", f"play@{BOT_USERNAME}"]) & other_filters)

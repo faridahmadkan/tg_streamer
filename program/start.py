@@ -136,6 +136,7 @@ async def help_cmd(client: Client, message: Message):
         f"📖 **{BOT_NAME} — commands**\n\n"
         "**▶️ Play**\n"
         "• `/play <query|YouTube URL>` — music (or reply to an audio file)\n"
+        "• `/provider` — choose the preferred music source (admins)\n"
         "• `/vplay <query|URL> [720|480|360] [mute]` — video (or reply to a video)\n"
         "• `/vstream <link>` — live / m3u8 / YouTube-live\n"
         "• `/library` · `/lplay <name>` — local media library\n"
