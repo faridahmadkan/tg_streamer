@@ -90,7 +90,7 @@ Open `http://localhost:3000/health` (or the port in `PORT`) to check the service
 
 ### YouTube HTTP 403 troubleshooting
 
-The bot uses a dedicated YouTube player client for audio/video extraction and
+The bot uses the YouTube TV player client for audio/video extraction and
 does not force a desktop browser User-Agent onto that client. yt-dlp is installed
 from `requirements.txt`; redeploy after updating dependencies. YouTube can still
 block datacenter IPs or require account cookies for some videos. If 403 persists,

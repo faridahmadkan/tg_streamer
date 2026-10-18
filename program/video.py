@@ -55,7 +55,7 @@ def _youtube_client_args():
     """Select a YouTube client that can expose audio formats without browser cookies."""
     # android_vr is often more reliable for server-side audio extraction than
     # combining TV and browser clients. Cookies remain supported when configured.
-    return ["--extractor-args", "youtube:player_client=android_vr"]
+    return ["--extractor-args", "youtube:player_client=tv"]
 
 
 def ytsearch(query: str):
@@ -197,7 +197,7 @@ async def ytdl(link, status_msg=None):
         # Prefer H.264 video + AAC(m4a) audio so the merge produces a universally
         # playable, light-to-stream mp4 (avoids AV1/VP9/Opus -> mp4 issues).
         "-f",
-        "bestvideo[height<=?720][ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=?720][ext=mp4]+bestaudio[ext=m4a]/best[height<=?720]/best",
+        "bestvideo[height<=?720][ext=mp4][vcodec^=avc1]+bestaudio/bestvideo[height<=?720][ext=mp4]+bestaudio/best[height<=?720]/best",
         "--merge-output-format",
         "mp4",
         "-o",

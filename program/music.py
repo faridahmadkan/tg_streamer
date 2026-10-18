@@ -47,7 +47,7 @@ def _youtube_client_args():
     """Select a YouTube client that can expose audio formats without browser cookies."""
     # android_vr is often more reliable for server-side audio extraction than
     # combining TV and browser clients. Cookies remain supported when configured.
-    return ["--extractor-args", "youtube:player_client=android_vr"]
+    return ["--extractor-args", "youtube:player_client=tv"]
 
 
 def ytsearch(query: str):
@@ -125,7 +125,7 @@ async def ytdl(format: str, link: str, status_msg=None):
         "--print",
         "after_move:filepath",
         "-f",
-        "bestaudio[ext=m4a]/bestaudio/best",
+        "bestaudio/best",
         "-o",
         "downloads/%(id)s.%(ext)s",
         f"{link}",
@@ -338,7 +338,7 @@ async def play(c: Client, m: Message):
                         image = await thumb(thumbnail, title, userid, ctitle)
                     except Exception as e:
                         return await suhu.edit(f"🚫 couldn't build the thumbnail: `{e}`")
-                    format = "bestaudio[ext=m4a]"
+                    format = "bestaudio/best"
                     ok, ytlink = await ytdl(format, url, suhu)
                     if ok == 0:
                         await suhu.edit(f"❌ yt-dl issues detected\n\n» `{ytlink}`")
@@ -396,7 +396,7 @@ async def play(c: Client, m: Message):
                     image = await thumb(thumbnail, title, userid, ctitle)
                 except Exception as e:
                     return await suhu.edit(f"🚫 couldn't build the thumbnail: `{e}`")
-                format = "bestaudio[ext=m4a]"
+                format = "bestaudio/best"
                 ok, ytlink = await ytdl(format, url, suhu)
                 if ok == 0:
                     await suhu.edit(f"❌ yt-dl issues detected\n\n» `{ytlink}`")
