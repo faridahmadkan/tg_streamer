@@ -33,7 +33,7 @@ _DEFAULT_USER_AGENT = (
 
 def _ytdl_site_flags():
     """Build yt-dlp flags shared by supported sites."""
-    flags = ["--socket-timeout", "60", "--retries", "3", "--fragment-retries", "3"]
+    flags = ["--socket-timeout", "60", "--retries", "5", "--fragment-retries", "5", "--extractor-retries", "3", "--file-access-retries", "3"]
     if COOKIES_FILE:
         flags += ["--cookies", COOKIES_FILE]
     # Do not force a desktop Chrome UA on YouTube's TV/mobile player clients:
@@ -84,6 +84,70 @@ def ytsearch(query: str):
     except Exception as e:
         log.warning("ytsearch failed: %s", e)
         return 0
+
+
+def ytsearch_all(query: str, limit: int = 5):
+    """Return deduplicated music candidates from YouTube and SoundCloud.
+
+    Search is metadata-only; playback still uses yt-dlp/ffmpeg. If one provider
+    blocks a track, the caller can try the next candidate rather than giving up.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    candidates = []
+    seen = set()
+
+    def add(title, url, duration="", thumbnail="", provider=""):
+        if not url or url in seen:
+            return
+        seen.add(url)
+        candidates.append([title or q, url, duration or "", thumbnail or "", provider])
+
+    # Preserve direct URL behavior. For a pasted URL, try it as the sole candidate.
+    if re.match(r"https?://", q, re.I):
+        first = ytsearch(q)
+        if first:
+            add(*first, provider="direct URL")
+        return candidates
+
+    # Provider 1: YouTube's search API wrapper (fast, metadata only).
+    try:
+        result = VideosSearch(q, limit=limit).result().get("result", [])
+        for item in result:
+            vid = item.get("id", "")
+            add(item.get("title"), item.get("link"), item.get("duration"),
+                f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if vid else "", "YouTube")
+    except Exception as exc:
+        log.warning("YouTube search provider failed: %s", exc)
+
+    # Provider 2: yt-dlp's own search extractors. SoundCloud is a separate
+    # catalog and often succeeds when YouTube search or media delivery fails.
+    for prefix, provider in (("scsearch", "SoundCloud"), ("ytsearch", "YouTube (yt-dlp)")):
+        try:
+            proc = subprocess.run(
+                ["yt-dlp", "--no-warnings", "--skip-download", "--flat-playlist",
+                 "--dump-single-json", *_ytdl_site_flags(), f"{prefix}{limit}:{q}"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                log.warning("%s search failed: %s", provider, proc.stderr[-250:])
+                continue
+            import json
+            data = json.loads(proc.stdout)
+            entries = data.get("entries") or [data]
+            for item in entries:
+                url = item.get("webpage_url") or item.get("url")
+                if url and not str(url).startswith("http"):
+                    if "youtube" in provider.lower() and item.get("id"):
+                        url = "https://www.youtube.com/watch?v=" + item["id"]
+                    else:
+                        continue
+                add(item.get("title"), url, item.get("duration_string") or "",
+                    item.get("thumbnail") or "", provider)
+        except Exception as exc:
+            log.warning("%s search provider error: %s", provider, exc)
+    return candidates
 
 
 _YT_RE = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/")
@@ -175,6 +239,27 @@ async def ytdl(format: str, link: str, status_msg=None):
     if proc.returncode == 0 and path:
         return 1, path
     return 0, ("".join(stderr_buf)[-500:] or "download failed")
+
+
+async def find_and_download_music(query: str, status_msg=None):
+    """Search multiple catalogs and try candidates until one streams/downloads."""
+    candidates = ytsearch_all(query, limit=5)
+    if not candidates:
+        return None, "No results found across YouTube and SoundCloud."
+    errors = []
+    for index, candidate in enumerate(candidates, start=1):
+        title, url, duration, thumbnail, provider = candidate
+        try:
+            if status_msg is not None:
+                await status_msg.edit(f"🔎 **Trying {provider or 'music provider'}** ({index}/{len(candidates)})…\n\n🏷 `{title[:70]}`")
+            ok, result = await ytdl("bestaudio/best", url, status_msg)
+            if ok:
+                return {"title": title, "url": url, "duration": duration,
+                        "thumbnail": thumbnail, "provider": provider, "media": result}, None
+            errors.append(f"{provider or 'provider'}: {str(result)[-180:]}")
+        except Exception as exc:
+            errors.append(f"{provider or 'provider'}: {str(exc)[-180:]}")
+    return None, "All providers failed. " + " | ".join(errors[-3:])
 
 
 @Client.on_message(command(["play", f"play@{BOT_USERNAME}"]) & other_filters)
@@ -324,15 +409,16 @@ async def play(c: Client, m: Message):
             else:
                 suhu = await c.send_message(chat_id, "🔍 **Searching...**", message_thread_id=thread_id)
                 query = m.text.split(None, 1)[1]
-                search = ytsearch(query)
-                if search == 0:
-                    await suhu.edit("❌ **no results found.**")
+                found, failure = await find_and_download_music(query, suhu)
+                if not found:
+                    await suhu.edit(f"❌ **Could not play this music.**\n\n» `{failure[:900]}`")
                 else:
-                    songname = search[0]
-                    title = search[0]
-                    url = search[1]
-                    duration = search[2]
-                    thumbnail = search[3]
+                    songname = found["title"]
+                    title = songname
+                    url = found["url"]
+                    duration = found["duration"]
+                    thumbnail = found["thumbnail"]
+                    ytlink = found["media"]
                     userid = m.from_user.id
                     gcname = m.chat.title
                     try:
@@ -340,39 +426,34 @@ async def play(c: Client, m: Message):
                         image = await thumb(thumbnail, title, userid, ctitle)
                     except Exception as e:
                         return await suhu.edit(f"🚫 couldn't build the thumbnail: `{e}`")
-                    format = "bestaudio/best"
-                    ok, ytlink = await ytdl(format, url, suhu)
-                    if ok == 0:
-                        await suhu.edit(f"❌ yt-dl issues detected\n\n» `{ytlink}`")
+                    if chat_id in QUEUE:
+                        pos = add_to_queue(
+                            chat_id, songname, ytlink, url, "Audio", 0
+                        )
+                        if pos == -1:
+                            return await suhu.edit(f"🚫 queue is full (max {MAX_QUEUE_SIZE}).")
+                        await suhu.delete()
+                        requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
+                        await m.reply_photo(
+                            photo=image,
+                            caption=f"💡 **Track added to queue »** `{pos}`\n\n🏷 **Name:** [{songname}]({url}) | `music`\n**⏱ Duration:** `{duration}`\n🎧 **Request by:** {requester}",
+                            reply_markup=keyboard,
+                        )
                     else:
-                        if chat_id in QUEUE:
-                            pos = add_to_queue(
-                                chat_id, songname, ytlink, url, "Audio", 0
-                            )
-                            if pos == -1:
-                                return await suhu.edit(f"🚫 queue is full (max {MAX_QUEUE_SIZE}).")
+                        try:
+                            await suhu.edit("🔄 **Joining vc...**")
+                            await call_py.play(chat_id, media_audio(ytlink))
+                            add_to_queue(chat_id, songname, ytlink, url, "Audio", 0)
                             await suhu.delete()
                             requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
                             await m.reply_photo(
                                 photo=image,
-                                caption=f"💡 **Track added to queue »** `{pos}`\n\n🏷 **Name:** [{songname}]({url}) | `music`\n**⏱ Duration:** `{duration}`\n🎧 **Request by:** {requester}",
+                                caption=f"🏷 **Name:** [{songname}]({url})\n**⏱ Duration:** `{duration}`\n💡 **Status:** `Playing`\n🎧 **Request by:** {requester}\n📹 **Stream type:** `Music`",
                                 reply_markup=keyboard,
                             )
-                        else:
-                            try:
-                                await suhu.edit("🔄 **Joining vc...**")
-                                await call_py.play(chat_id, media_audio(ytlink))
-                                add_to_queue(chat_id, songname, ytlink, url, "Audio", 0)
-                                await suhu.delete()
-                                requester = f"[{m.from_user.first_name}](tg://user?id={m.from_user.id})"
-                                await m.reply_photo(
-                                    photo=image,
-                                    caption=f"🏷 **Name:** [{songname}]({url})\n**⏱ Duration:** `{duration}`\n💡 **Status:** `Playing`\n🎧 **Request by:** {requester}\n📹 **Stream type:** `Music`",
-                                    reply_markup=keyboard,
-                                )
-                            except Exception as ep:
-                                await suhu.delete()
-                                await m.reply_text(f"🚫 error: `{ep}`")
+                        except Exception as ep:
+                            await suhu.delete()
+                            await m.reply_text(f"🚫 error: `{ep}`")
 
     else:
         if len(cmd_args) < 2:
@@ -382,15 +463,16 @@ async def play(c: Client, m: Message):
         else:
             suhu = await c.send_message(chat_id, "🔍 **Searching...**", message_thread_id=thread_id)
             query = m.text.split(None, 1)[1]
-            search = ytsearch(query)
-            if search == 0:
-                await suhu.edit("❌ **no results found.**")
+            found, failure = await find_and_download_music(query, suhu)
+            if not found:
+                await suhu.edit(f"❌ **Could not play this music.**\n\n» `{failure[:900]}`")
             else:
-                songname = search[0]
-                title = search[0]
-                url = search[1]
-                duration = search[2]
-                thumbnail = search[3]
+                songname = found["title"]
+                title = songname
+                url = found["url"]
+                duration = found["duration"]
+                thumbnail = found["thumbnail"]
+                ytlink = found["media"]
                 userid = m.from_user.id
                 gcname = m.chat.title
                 try:
@@ -398,11 +480,6 @@ async def play(c: Client, m: Message):
                     image = await thumb(thumbnail, title, userid, ctitle)
                 except Exception as e:
                     return await suhu.edit(f"🚫 couldn't build the thumbnail: `{e}`")
-                format = "bestaudio/best"
-                ok, ytlink = await ytdl(format, url, suhu)
-                if ok == 0:
-                    await suhu.edit(f"❌ yt-dl issues detected\n\n» `{ytlink}`")
-                else:
                     if chat_id in QUEUE:
                         pos = add_to_queue(chat_id, songname, ytlink, url, "Audio", 0)
                         if pos == -1:
