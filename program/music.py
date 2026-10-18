@@ -26,6 +26,88 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 log = logging.getLogger(__name__)
 
+# Live now-playing progress cards. One updater per chat; it stops when the
+# current queue item changes or the message can no longer be edited.
+_PLAYBACK_PROGRESS_TASKS = {}
+
+def _duration_seconds(value):
+    """Parse common duration forms (mm:ss, hh:mm:ss, or seconds)."""
+    if value is None:
+        return 0
+    try:
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+        value = str(value).strip()
+        if not value:
+            return 0
+        if ":" in value:
+            parts = [int(part) for part in value.split(":")]
+            total = 0
+            for part in parts:
+                total = total * 60 + part
+            return max(0, total)
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+def _clock(seconds):
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+def _progress_caption(title, url, duration, requester, position):
+    total = _duration_seconds(duration)
+    if total > 0:
+        ratio = min(1.0, max(0.0, position / total))
+        filled = min(12, int(ratio * 12))
+        bar = "━" * filled + ("●" if filled < 12 else "") + "─" * max(0, 11 - filled)
+        timeline = f"`{_clock(position)}` {bar} `{_clock(total)}`"
+    else:
+        # Duration is not always supplied by a provider; still show elapsed time.
+        timeline = f"`{_clock(position)}` {"━" * (1 + (position // 10) % 10)}●"
+    return (f"🏷 **Name:** [{title[:70]}]({url})\n"
+            f"⏱ **Duration:** `{_clock(total) if total else (str(duration) or 'Unknown')}`\n"
+            f"{timeline}\n"
+            f"💡 **Status:** `Playing`\n🎧 **Request by:** {requester}\n📹 **Stream type:** `Music`")
+
+async def start_playback_progress(chat_id, message, title, url, duration, requester, keyboard):
+    """Refresh the now-playing caption with an elapsed/total progress bar."""
+    old = _PLAYBACK_PROGRESS_TASKS.get(chat_id)
+    if old and not old.done():
+        old.cancel()
+
+    async def update():
+        try:
+            while True:
+                await asyncio.sleep(8)
+                queue = QUEUE.get(chat_id) or []
+                if not queue or queue[0][0] != title or queue[0][2] != url:
+                    return
+                try:
+                    position = int(await call_py.time(chat_id))
+                except Exception:
+                    continue
+                caption = _progress_caption(title, url, duration, requester, position)
+                try:
+                    if getattr(message, "photo", None):
+                        await message.edit_caption(caption=caption, reply_markup=keyboard)
+                    else:
+                        await message.edit_text(caption, reply_markup=keyboard, link_preview_options=LinkPreviewOptions(is_disabled=True))
+                except Exception as exc:
+                    log.debug("Playback progress updater stopped: %s", exc)
+                    return
+                total = _duration_seconds(duration)
+                if total and position >= total:
+                    return
+        except asyncio.CancelledError:
+            return
+        finally:
+            if _PLAYBACK_PROGRESS_TASKS.get(chat_id) is asyncio.current_task():
+                _PLAYBACK_PROGRESS_TASKS.pop(chat_id, None)
+
+    _PLAYBACK_PROGRESS_TASKS[chat_id] = asyncio.create_task(update())
+
 _PROVIDER_FILE = Path("data/music_provider.json")
 _PROVIDER_OPTIONS = {
     "auto": "Auto (SoundCloud + Internet Archive)",
@@ -580,11 +662,12 @@ async def play(c: Client, m: Message):
                 await suhu.delete()
             except Exception:
                 pass
-            caption = f"🏷 **Name:** [{songname}]({url})\n**⏱ Duration:** `{duration}`\n💡 **Status:** `Playing`\n🎧 **Request by:** {requester}\n📹 **Stream type:** `Music`"
+            caption = _progress_caption(songname, url, duration, requester, 0)
             try:
                 if image:
-                    await m.reply_photo(photo=image, caption=caption, reply_markup=keyboard)
+                    status_message = await m.reply_photo(photo=image, caption=caption, reply_markup=keyboard)
                 else:
-                    await m.reply_text(caption, reply_markup=keyboard)
+                    status_message = await m.reply_text(caption, reply_markup=keyboard)
+                await start_playback_progress(chat_id, status_message, songname, url, duration, requester, keyboard)
             except Exception as exc:
                 log.warning("Playback started but status announcement failed: %s", exc)
