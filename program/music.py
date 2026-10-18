@@ -187,9 +187,55 @@ def ytsearch_all(query: str, limit: int = 5):
 
 
 _YT_RE = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/")
+_SOUNDCLOUD_RE = re.compile(r"https?://(www\.)?soundcloud\.com/", re.I)
+
+
+async def _download_soundcloud(link: str):
+    """Download SoundCloud audio locally instead of feeding a short-lived URL to FFmpeg.
+
+    Some SoundCloud stream URLs resolve successfully in yt-dlp but then produce an
+    immediate EOF in the NTgCalls FFmpeg reader. A local file avoids that direct-URL
+    playback path and makes extraction/download failures visible in the logs.
+    """
+    started_at = time()
+    downloads = Path("downloads")
+    downloads.mkdir(parents=True, exist_ok=True)
+    log.info("Downloading SoundCloud track locally before playback: %s", link[:180])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp", "--no-warnings", "--no-playlist", "--no-part", "--newline",
+            *_ytdl_site_flags(),
+            "-f", "bestaudio/best",
+            "-o", str(downloads / "%(extractor)s-%(id)s.%(ext)s"),
+            "--print", "after_move:filepath",
+            link,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except Exception:
+        log.exception("Could not launch yt-dlp for SoundCloud download")
+        return 0, "Could not start yt-dlp for SoundCloud download."
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        log.warning("SoundCloud download timed out after 120s")
+        proc.kill()
+        await proc.wait()
+        return 0, "SoundCloud audio download timed out after 120 seconds."
+    elapsed = time() - started_at
+    lines = [line.strip() for line in stdout.decode(errors="ignore").splitlines() if line.strip()]
+    local_path = Path(lines[-1]) if lines else None
+    if proc.returncode == 0 and local_path and local_path.is_file() and local_path.stat().st_size > 16_000:
+        log.info("SoundCloud audio downloaded locally in %.1fs (%s bytes): %s", elapsed, local_path.stat().st_size, local_path)
+        return 1, str(local_path.resolve())
+    err = stderr.decode(errors="ignore")[-700:]
+    log.warning("SoundCloud local download failed (exit=%s, %.1fs): %s", proc.returncode, elapsed, err or "no output file")
+    return 0, (err or "SoundCloud download did not produce a valid audio file.")
 
 
 async def ytdl(format: str, link: str, status_msg=None):
+    if _SOUNDCLOUD_RE.match(link):
+        return await _download_soundcloud(link)
     # For non-YouTube sites (e.g. Rutube) the formats are HLS-only muxed streams
     # that would require downloading gigabytes before playback.  Instead, extract
     # the direct stream URL and hand it to ffmpeg live (same as radio).
@@ -317,13 +363,14 @@ async def find_and_download_music(query: str, status_msg=None):
             if status_msg is not None:
                 await status_msg.edit(f"🔎 **Trying {provider or 'music provider'}** ({index}/{len(candidates)})…\n\n🏷 `{title[:70]}`")
             # A single extractor must never leave the request stuck indefinitely.
+            attempt_timeout = 145 if _SOUNDCLOUD_RE.match(url) else 85
             try:
                 ok, result = await asyncio.wait_for(
-                    ytdl("bestaudio/best", url, status_msg), timeout=85
+                    ytdl("bestaudio/best", url, status_msg), timeout=attempt_timeout
                 )
             except asyncio.TimeoutError:
-                ok, result = 0, "Provider attempt timed out after 85 seconds."
-                log.warning("Candidate timed out after 85s: provider=%s url=%s", provider, url[:180])
+                ok, result = 0, f"Provider attempt timed out after {attempt_timeout} seconds."
+                log.warning("Candidate timed out after %ss: provider=%s url=%s", attempt_timeout, provider, url[:180])
             elapsed = time() - started_at
             if ok:
                 log.info("Candidate resolved successfully in %.1fs: provider=%s", elapsed, provider)
