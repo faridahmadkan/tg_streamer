@@ -193,7 +193,7 @@ async def ytdl(link, status_msg=None):
         "--newline",
         "--progress-template",
         "download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-        # Cookies require the web client; without cookies use android client.
+        # When cookies are configured, use the web client; otherwise try TV/Safari.
         *(_youtube_client_args() if _YT_RE.match(link) else []),
         # Prefer H.264 video + AAC(m4a) audio so the merge produces a universally
         # playable, light-to-stream mp4 (avoids AV1/VP9/Opus -> mp4 issues).

@@ -24,4 +24,4 @@ cmds = [
 ]
 
 [start]
-cmd = "node server.js"
+cmd = "PATH=.venv/bin:$PATH node server.js"

@@ -85,9 +85,24 @@ MAX_QUEUE_SIZE = int(getenv("MAX_QUEUE_SIZE", "50"))
 # e.g. "sponsor,selfpromo,interaction,intro,outro,music_offtopic". Empty = off.
 SPONSORBLOCK_REMOVE = getenv("SPONSORBLOCK_REMOVE", "").strip()
 
-# yt-dlp cookies — path to a Netscape-format cookies.txt for sites that require
-# authentication (age-gated, members-only, etc.). Empty = no cookies.
+# yt-dlp cookies. Railway can provide either COOKIES_FILE (a path to a
+# Netscape-format cookies.txt) or COOKIES_BASE64 (the complete file encoded
+# as Base64). Never commit cookies.txt or its Base64 value to GitHub.
+import base64 as _base64
+import os as _os
 COOKIES_FILE = getenv("COOKIES_FILE", "").strip()
+_COOKIES_BASE64 = getenv("COOKIES_BASE64", "").strip()
+if _COOKIES_BASE64 and not COOKIES_FILE:
+    try:
+        _cookie_path = "/tmp/khan_streamer_youtube_cookies.txt"
+        with open(_cookie_path, "wb") as _cookie_out:
+            _cookie_out.write(_base64.b64decode(_COOKIES_BASE64, validate=True))
+        _os.chmod(_cookie_path, 0o600)
+        COOKIES_FILE = _cookie_path
+    except Exception as _cookie_error:
+        raise RuntimeError("COOKIES_BASE64 is invalid; provide Base64-encoded Netscape cookies.txt") from _cookie_error
+if COOKIES_FILE and not _os.path.isfile(COOKIES_FILE):
+    raise RuntimeError("COOKIES_FILE points to a missing file; use COOKIES_BASE64 in Railway or provide a valid file path")
 
 # yt-dlp proxy — proxy URL for non-YouTube downloads (e.g. socks5://user:pass@host:1080).
 # Empty = direct connection.

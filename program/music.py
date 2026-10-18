@@ -121,7 +121,7 @@ async def ytdl(format: str, link: str, status_msg=None):
         "--newline",
         "--progress-template",
         "download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-        # Cookies require the web client; without cookies use android client.
+        # When cookies are configured, use the web client; otherwise try TV/Safari.
         *(_youtube_client_args() if _YT_RE.match(link) else []),
         "--print",
         "after_move:filepath",
