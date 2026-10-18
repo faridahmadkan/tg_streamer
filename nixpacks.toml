@@ -1,8 +1,12 @@
+
+providers = ["node", "python"]
+
 [phases.setup]
-nixPkgs = ["python311", "ffmpeg", "gcc", "pkg-config", "git"]
+nixPkgs = ["nodejs", "python311", "ffmpeg", "gcc", "pkg-config", "git"]
 
 [phases.install]
 cmds = [
+  "node --version && npm --version",
   "npm install --omit=dev",
   "python3 -m venv .venv",
   ".venv/bin/pip install --upgrade pip setuptools wheel",
