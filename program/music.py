@@ -142,7 +142,7 @@ def _set_provider(value):
 
 def _ytdl_site_flags():
     """Build yt-dlp flags shared by supported sites."""
-    flags = ["--socket-timeout", "60", "--retries", "5", "--fragment-retries", "5", "--extractor-retries", "3", "--file-access-retries", "3"]
+    flags = ["--socket-timeout", "12", "--retries", "2", "--fragment-retries", "2", "--extractor-retries", "2", "--file-access-retries", "1"]
     if COOKIES_FILE:
         flags += ["--cookies", COOKIES_FILE]
     if PROXY_URL:
@@ -164,16 +164,16 @@ def _internet_archive_search(query: str, limit: int = 5):
 
     safe_query = query.replace('"', ' ').strip()[:100]
     params = urlencode({
-        "q": f'mediatype:audio AND (title:"{safe_query}" OR creator:"{safe_query}" OR description:"{safe_query}")',
+        "q": f'mediatype:audio AND (title:{safe_query} OR creator:{safe_query} OR description:{safe_query})',
         "fl[]": ["identifier", "title", "creator"],
-        "rows": max(1, min(limit, 8)),
+        "rows": max(1, min(limit, 4)),
         "output": "json",
     }, doseq=True)
     request = Request("https://archive.org/advancedsearch.php?" + params,
                       headers={"User-Agent": "KhanStreamer/1.0 (audio catalog search)"})
     results = []
     try:
-        with urlopen(request, timeout=8) as response:
+        with urlopen(request, timeout=5) as response:
             docs = json.loads(response.read().decode("utf-8")).get("response", {}).get("docs", [])
         for item in docs:
             identifier = item.get("identifier")
@@ -182,7 +182,7 @@ def _internet_archive_search(query: str, limit: int = 5):
             meta_req = Request(f"https://archive.org/metadata/{quote(identifier)}",
                                headers={"User-Agent": "KhanStreamer/1.0"})
             try:
-                with urlopen(meta_req, timeout=8) as response:
+                with urlopen(meta_req, timeout=3) as response:
                     files = json.loads(response.read().decode("utf-8")).get("files", [])
             except Exception as exc:
                 log.debug("Archive metadata failed for %s: %s", identifier, exc)
@@ -262,21 +262,32 @@ def ytsearch_all(query: str, limit: int = 5):
     selected = _get_provider()
     if selected in ("auto", "soundcloud"):
         try:
+            # Flat search avoids resolving every result's stream URL during search.
+            # Use webpage_url only: internal SoundCloud API URLs are not playable pages.
             proc = subprocess.run(
-                ["yt-dlp", "--no-warnings", "--skip-download", "--dump-single-json",
-                 *_ytdl_site_flags(), f"scsearch{limit}:{q}"],
-                capture_output=True, text=True, timeout=22,
+                ["yt-dlp", "--ignore-config", "--no-warnings", "--skip-download",
+                 "--flat-playlist", "--dump-single-json", "--socket-timeout", "8",
+                 "--extractor-retries", "1", *_ytdl_site_flags(), f"scsearch{min(limit, 8)}:{q}"],
+                capture_output=True, text=True, timeout=14,
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 data = json.loads(proc.stdout)
-                for item in data.get("entries") or [data]:
-                    url = item.get("webpage_url") or item.get("url")
-                    if url and not str(url).startswith(("http://", "https://")):
+                entries = data.get("entries") or [data]
+                for item in entries:
+                    url = item.get("webpage_url")
+                    if not url:
+                        continue
+                    host = url.lower().split("/")[2] if "://" in url else ""
+                    if "soundcloud.com" not in host or "api.soundcloud.com" in host:
                         continue
                     add(item.get("title"), url, item.get("duration_string") or item.get("duration") or "",
                         item.get("thumbnail") or "", "SoundCloud")
+                    if len(candidates) >= limit:
+                        break
             else:
                 log.warning("SoundCloud search failed: %s", (proc.stderr or "")[-250:])
+        except subprocess.TimeoutExpired:
+            log.warning("SoundCloud search timed out for query=%r", q[:80])
         except Exception as exc:
             log.warning("SoundCloud search error: %s", exc)
 
@@ -299,18 +310,18 @@ async def _download_provider_audio(link: str):
     try:
         proc = await asyncio.create_subprocess_exec(
             "yt-dlp", "--ignore-config", "--no-warnings", "--no-playlist", "--no-part", "--newline",
-            "--retries", "10", "--fragment-retries", "10", "--extractor-retries", "5",
+            "--retries", "2", "--fragment-retries", "2", "--extractor-retries", "2",
             *_ytdl_site_flags(), "-f", "bestaudio/best",
             "-o", str(downloads / "%(extractor)s-%(id)s.%(ext)s"),
             "--print", "after_move:filepath", link,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
     except asyncio.TimeoutError:
         log.warning("Provider audio download timed out after 120s: %s", link[:160])
         proc.kill()
         await proc.wait()
-        return 0, "Audio download timed out after 120 seconds."
+        return 0, "Audio download timed out after 45 seconds."
     except Exception:
         log.exception("Could not start provider audio download")
         return 0, "Could not start audio downloader."
@@ -348,7 +359,7 @@ async def find_and_download_music(query: str, status_msg=None):
             if status_msg is not None:
                 await status_msg.edit(f"🔎 **Trying {provider or 'music provider'}** ({index}/{len(candidates)})…\n\n🏷 `{title[:70]}`")
             # A single extractor must never leave the request stuck indefinitely.
-            attempt_timeout = 125
+            attempt_timeout = 35
             try:
                 ok, result = await asyncio.wait_for(
                     ytdl("bestaudio/best", url, status_msg), timeout=attempt_timeout

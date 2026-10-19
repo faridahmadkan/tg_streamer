@@ -122,7 +122,10 @@ async def track_position():
                 call = calls.get(chat_id)
 
                 # idle auto-leave: leave once nobody's been listening for a while
-                if IDLE_LEAVE_MINUTES > 0 and ticks % 6 == 0 and not is_live(chat_id):
+                # Never auto-leave a live stream (IPTV/radio), even if live state was
+                # not persisted correctly but the queue head identifies a live item.
+                live_item = bool(head and len(head) > 3 and str(head[3]).lower() in {"video", "radio", "live", "iptv"})
+                if IDLE_LEAVE_MINUTES > 0 and ticks % 6 == 0 and not is_live(chat_id) and not live_item:
                     try:
                         parts = await call_py.get_participants(chat_id)
                         n = len(parts) if parts is not None else None

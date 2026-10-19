@@ -24,6 +24,7 @@ _INDEX_URL = "https://iptv-org.github.io/iptv/index.m3u"
 _REPO_URL = "https://github.com/iptv-org/iptv"
 _COUNTRY_PLAYLISTS_URL = f"{_REPO_URL}#playlists-by-country"
 _CACHE_TTL = 12 * 3600  # refresh every 12 h
+_PLAYLIST_FETCH_TIMEOUT = 18
 
 # Some HLS master playlists (multi-variant) confuse ffmpeg 5.1.x.
 # Download the master, pick a single variant URL, and feed that instead.
@@ -41,7 +42,7 @@ def _resolve_hls_variant(url: str) -> str:
             url,
             headers={"User-Agent": _HLS_UA, "Referer": "https://rutube.ru/"},
         )
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=4) as r:
             body = r.read().decode("utf-8", errors="ignore")
 
         # Not a master playlist → use the URL as-is
@@ -131,7 +132,7 @@ async def _get_channels() -> list:
             loop = asyncio.get_event_loop()
             raw = await loop.run_in_executor(
                 None,
-                lambda: urllib.request.urlopen(_INDEX_URL, timeout=60)
+                lambda: urllib.request.urlopen(_INDEX_URL, timeout=_PLAYLIST_FETCH_TIMEOUT)
                          .read().decode("utf-8", errors="ignore"),
             )
             parsed = _parse_m3u(raw)
@@ -318,7 +319,11 @@ async def iptv_pick(c: Client, query: CallbackQuery):
         log.info("IPTV: calling play() for %s", label)
         # Resolve HLS master playlists to a single variant — ffmpeg 5.1
         # chokes on multi-variant manifests from certain CDNs (Rutube etc.)
-        resolved = _resolve_hls_variant(url)
+        try:
+            resolved = await asyncio.wait_for(asyncio.to_thread(_resolve_hls_variant, url), timeout=5)
+        except asyncio.TimeoutError:
+            log.warning("IPTV: HLS variant probe timed out; using original stream URL")
+            resolved = url
         if resolved != url:
             log.info("IPTV: resolved HLS variant for %s", label)
         stream = MediaStream(
