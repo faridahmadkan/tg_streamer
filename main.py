@@ -18,6 +18,7 @@ from driver.queues import load_resume, load_topic_lock
 from program.resume import track_position
 from program.radio import radio_updater
 import program.iptv  # registers /iptv handlers
+import program.access_notice  # friendly access-denied notices for non-admin group actions
 
 BOT_COMMANDS = [
     BotCommand("provider", "choose music search provider (bot admin)"),
