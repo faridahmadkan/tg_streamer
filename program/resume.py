@@ -12,7 +12,7 @@ import logging
 
 from config import BOT_USERNAME, IDLE_LEAVE_MINUTES
 from driver.clients import call_py, bot
-from driver.queues import QUEUE, RESUME, get_queue, save_resume, clear_queue, is_loop, get_active_thread, is_paused
+from driver.queues import QUEUE, RESUME, get_queue, save_resume, clear_queue, is_loop, get_active_thread, is_paused, is_live
 from driver.filters import command, other_filters, access_filter
 from driver.decorators import authorized_users_only, errors, errors_cb
 from driver.utils import can_manage_vc, control_panel, maybe_prefetch_autoplay
@@ -122,7 +122,7 @@ async def track_position():
                 call = calls.get(chat_id)
 
                 # idle auto-leave: leave once nobody's been listening for a while
-                if IDLE_LEAVE_MINUTES > 0 and ticks % 6 == 0:
+                if IDLE_LEAVE_MINUTES > 0 and ticks % 6 == 0 and not is_live(chat_id):
                     try:
                         parts = await call_py.get_participants(chat_id)
                         n = len(parts) if parts is not None else None

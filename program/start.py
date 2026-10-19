@@ -16,7 +16,7 @@ from config import (
 from program import __version__
 from driver.clients import user
 from driver.decorators import errors
-from driver.filters import command, other_filters, rate_limit
+from driver.filters import command, other_filters
 from pyrogram import Client, filters
 from pyrogram import __version__ as pyrover
 from pytgcalls import (__version__ as pytover)
@@ -52,22 +52,10 @@ async def _human_time_duration(seconds):
 
 
 @Client.on_message(
-    filters.command(["start", f"start@{BOT_USERNAME}"]) & filters.private & rate_limit
+    command(["start", f"start@{BOT_USERNAME}"]) & filters.private
 )
 @errors
 async def start_(client: Client, message: Message):
-    if not message.from_user or message.from_user.id not in __import__("config").BOT_ADMINS:
-        await message.reply_text(
-            f"🎵 **{BOT_NAME} — Telegram Group Music Bot**\n\n"
-            "Play music in supported Telegram group voice chats, browse music sources, "
-            "and use playback controls. Access is currently limited to authorized users/groups.\n\n"
-            "To purchase or request access, contact the owner using the button below.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💬 Contact for Purchase", url="https://t.me/faridahmad2003")
-            ]]),
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
-        return
     rows = [
         [
             InlineKeyboardButton(
@@ -155,7 +143,7 @@ async def help_cmd(client: Client, message: Message):
         "• `/radio` — internet radio stations\n"
         "• `/iptv <name>` — live TV (iptv-org catalogue, 50k+ channels) · `/iptv` for links\n"
         "• `/record [duration]` · `/record 01:30:00 02:00:00` — record or clip a range · `/stoprec`\n"
-        "• `/search <query>` — search YouTube, SoundCloud and Internet Archive music\n"
+        "• `/search <query>` — search SoundCloud and Internet Archive music\n"
         "• `/song <query>` · `/video <query>` — download instead of stream\n\n"
         "**🎛 Controls** (admins)\n"
         "• `/pause` `/resume` `/skip` `/stop`\n"
