@@ -111,7 +111,8 @@ async def start_playback_progress(chat_id, message, title, url, duration, reques
 
 _PROVIDER_FILE = Path("data/music_provider.json")
 _PROVIDER_OPTIONS = {
-    "auto": "Auto (SoundCloud + Internet Archive)",
+    "auto": "Auto (YouTube + SoundCloud + Internet Archive)",
+    "youtube": "YouTube search",
     "soundcloud": "SoundCloud search",
     "archive": "Internet Archive (public/authorized audio)",
     "bandcamp": "Bandcamp (direct links)",
@@ -152,7 +153,7 @@ def _ytdl_site_flags():
 _YOUTUBE_RE = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/", re.I)
 _AUDIO_HOSTS = (
     "soundcloud.com", "bandcamp.com", "audiomack.com", "mixcloud.com",
-    "archive.org", "www.archive.org",
+    "archive.org", "www.archive.org", "youtube.com", "www.youtube.com", "youtu.be",
 )
 
 
@@ -225,15 +226,12 @@ def ytsearch_all(query: str, limit: int = 5):
         if not url:
             return
         url = str(url).strip()
-        if not url.startswith(("https://", "http://")) or url in seen or _YOUTUBE_RE.match(url):
+        if not url.startswith(("https://", "http://")) or url in seen:
             return
         seen.add(url)
         candidates.append([title or q, url, duration or "", thumbnail or "", provider])
 
     if re.match(r"https?://", q, re.I):
-        if _YOUTUBE_RE.match(q):
-            log.info("Rejected YouTube URL because YouTube support is disabled for music")
-            return []
         if not any(host in q.lower().split("/")[2] for host in _AUDIO_HOSTS):
             log.warning("Direct music URL is not from an enabled provider: %s", q[:160])
             return []
@@ -251,7 +249,7 @@ def ytsearch_all(query: str, limit: int = 5):
             provider = next((name for domain, name in [
                 ("soundcloud.com", "SoundCloud"), ("bandcamp.com", "Bandcamp"),
                 ("audiomack.com", "Audiomack"), ("mixcloud.com", "Mixcloud"),
-                ("archive.org", "Internet Archive")
+                ("archive.org", "Internet Archive"), ("youtube.com", "YouTube"), ("youtu.be", "YouTube")
             ] if domain in host), "Audio provider")
             add(title, q, duration, thumbnail, provider)
         except Exception as exc:
@@ -259,11 +257,31 @@ def ytsearch_all(query: str, limit: int = 5):
         return candidates
 
     selected = _get_provider()
-    if selected in ("auto", "soundcloud"):
+    if selected in ("auto", "youtube"):
+        try:
+            # yt-dlp's search extractor supports YouTube and many compatible search backends.
+            proc = subprocess.run(
+                ["yt-dlp", "--no-warnings", "--skip-download", "--flat-playlist", "--dump-single-json",
+                 *_ytdl_site_flags(), "--socket-timeout", "10", "--retries", "1", "--extractor-retries", "1",
+                 f"ytsearch{limit}:{q}"],
+                capture_output=True, text=True, timeout=14,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                data = json.loads(proc.stdout)
+                for item in data.get("entries") or [data]:
+                    url = item.get("webpage_url") or item.get("url")
+                    if url and not str(url).startswith(("http://", "https://")):
+                        continue
+                    add(item.get("title"), url, item.get("duration_string") or item.get("duration") or "",
+                        item.get("thumbnail") or "", "YouTube")
+        except Exception as exc:
+            log.debug("YouTube search unavailable: %s", exc)
+
+    if selected in ("auto", "soundcloud") and len(candidates) < limit:
         try:
             proc = subprocess.run(
                 ["yt-dlp", "--no-warnings", "--skip-download", "--flat-playlist", "--dump-single-json",
-                 *_ytdl_site_flags(), f"scsearch{limit}:{q}"],
+                 *_ytdl_site_flags(), f"scsearch{max(1, limit - len(candidates))}:{q}"],
                 capture_output=True, text=True, timeout=22,
             )
             if proc.returncode == 0 and proc.stdout.strip():
@@ -324,8 +342,6 @@ async def _download_provider_audio(link: str):
 
 
 async def ytdl(format: str, link: str, status_msg=None):
-    if _YOUTUBE_RE.match(link):
-        return 0, "YouTube is disabled for music. Use a SoundCloud or Internet Archive search, or a supported provider link."
     return await _download_provider_audio(link)
 
 

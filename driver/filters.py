@@ -2,8 +2,9 @@ import re
 from time import monotonic
 from typing import List, Union
 
-from pyrogram import filters
+from pyrogram import filters, Client, StopPropagation
 from pyrogram.enums import ChatType
+
 
 from config import ALLOWED_GROUPS, BOT_ADMINS, BOT_USERNAME, COMMAND_PREFIXES, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, SUDO_USERS
 from driver.queues import TOPIC_LOCK
@@ -114,3 +115,49 @@ access_filter = filters.create(_access_ok)
 
 def command(commands: Union[str, List[str]]):
     return filters.command(commands, COMMAND_PREFIXES) & rate_limit & access_filter
+
+
+# Friendly denial for unauthorized group commands and inline control buttons.
+async def _friendly_unauthorized_message(client, message):
+    user = getattr(message, "from_user", None)
+    chat = getattr(message, "chat", None)
+    text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    if not user or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.FORUM):
+        return
+    if not re.match(r"^[\/!.]", text):
+        return
+    if chat.id not in ALLOWED_GROUPS:
+        return
+    try:
+        admins = await get_administrators(chat)
+        if user.id in admins:
+            return
+    except Exception:
+        pass
+    await message.reply_text("🔒 Only group admins are allowed to use this bot's commands.")
+    raise StopPropagation
+
+async def _friendly_unauthorized_callback(client, query):
+    user = getattr(query, "from_user", None)
+    message = getattr(query, "message", None)
+    chat = getattr(message, "chat", None)
+    if not user or not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.FORUM):
+        return
+    if chat.id not in ALLOWED_GROUPS:
+        return
+    try:
+        admins = await get_administrators(chat)
+        if user.id in admins:
+            return
+    except Exception:
+        pass
+    await query.answer("🔒 Only group admins can use these controls.", show_alert=True)
+    raise StopPropagation
+
+@Client.on_message(filters.group & filters.text, group=-1)
+async def _friendly_message_handler(client, message):
+    await _friendly_unauthorized_message(client, message)
+
+@Client.on_callback_query(group=-1)
+async def _friendly_callback_handler(client, query):
+    await _friendly_unauthorized_callback(client, query)
